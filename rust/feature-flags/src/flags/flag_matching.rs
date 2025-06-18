@@ -19,6 +19,7 @@ use crate::metrics::consts::{
 };
 use crate::metrics::utils::parse_exception_for_prometheus_label;
 use crate::properties::property_models::PropertyFilter;
+use crate::utils::graph_utils::DependencyGraph;
 use anyhow::Result;
 use common_database::Client as DatabaseClient;
 use common_metrics::inc;
@@ -420,16 +421,42 @@ impl FeatureFlagMatcher {
             .initialize_group_type_mappings_if_needed(&feature_flags)
             .await;
 
-        // Evaluate all flags in the current level
-        let (flag_details_map, level_errors) = self
-            .evaluate_flags_in_level(
-                &feature_flags.flags,
-                &person_property_overrides,
-                &group_property_overrides,
-                hash_key_overrides,
-            )
-            .await;
-        errors_while_computing_flags |= level_errors;
+        let (flag_dependency_graph, errors) =
+            match DependencyGraph::from_nodes(&feature_flags.flags) {
+                Ok((graph, errors)) => (graph, errors),
+                Err(e) => {
+                    error!("Failed to build feature flag dependency graph: {:?}", e);
+                    return FlagsResponse {
+                        errors_while_computing_flags: true,
+                        flags: HashMap::new(),
+                        quota_limited: None,
+                        request_id,
+                        config: ConfigResponse::default(),
+                    };
+                }
+            };
+
+        if !errors.is_empty() {
+            errors_while_computing_flags = true;
+            // TODO: Make sure this call reports a useful error message.
+            error!("There were errors building the feature flag dependency graph. Will attempt to evaluate the rest of the flags: {:?}", errors);
+        }
+
+        let mut flag_details_map = HashMap::new();
+        let evaluation_stages = flag_dependency_graph.evaluation_stages().unwrap();
+        for stage in evaluation_stages {
+            let stage_flags: Vec<FeatureFlag> = stage.iter().map(|&flag| flag.clone()).collect();
+            let (level_flag_details_map, level_errors) = self
+                .evaluate_flags_in_level(
+                    &stage_flags,
+                    &person_property_overrides,
+                    &group_property_overrides,
+                    hash_key_overrides.clone(),
+                )
+                .await;
+            errors_while_computing_flags |= level_errors;
+            flag_details_map.extend(level_flag_details_map);
+        }
 
         FlagsResponse {
             errors_while_computing_flags,
