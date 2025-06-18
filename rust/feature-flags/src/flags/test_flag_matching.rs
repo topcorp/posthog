@@ -282,6 +282,465 @@ mod tests {
         );
     }
 
+    pub fn create_test_flag_with_property(
+        id: i32,
+        team_id: TeamId,
+        key: &str,
+        filter: PropertyFilter,
+    ) -> FeatureFlag {
+        create_test_flag(
+            Some(id),
+            Some(team_id),
+            None,
+            Some(key.to_string()),
+            Some(FlagFilters {
+                groups: vec![FlagPropertyGroup {
+                    properties: Some(vec![filter]),
+                    rollout_percentage: Some(100.0),
+                    variant: None,
+                }],
+                multivariate: None,
+                aggregation_group_type_index: None,
+                payloads: None,
+                super_groups: None,
+                holdout_groups: None,
+            }),
+            None,
+            None,
+            None,
+        )
+    }
+
+    pub fn create_test_flag_that_depends_on_flag(
+        id: i32,
+        team_id: TeamId,
+        key: &str,
+        depends_on_flag_id: i32,
+        depends_on_flag_value: FlagValue,
+    ) -> FeatureFlag {
+        create_test_flag_with_property(
+            id,
+            team_id,
+            key,
+            PropertyFilter {
+                key: depends_on_flag_id.to_string(),
+                value: Some(json!(depends_on_flag_value)),
+                operator: Some(OperatorType::Exact),
+                prop_type: PropertyType::Flag,
+                group_type_index: None,
+                negation: None,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn test_flags_that_depends_on_other_boolean_flag() {
+        let reader = setup_pg_reader_client(None).await;
+        let writer = setup_pg_writer_client(None).await;
+        let cohort_cache = Arc::new(CohortCacheManager::new(reader.clone(), None, None));
+        let team = insert_new_team_in_pg(reader.clone(), None).await.unwrap();
+
+        let leaf_flag = create_test_flag_with_property(
+            23,
+            team.id,
+            "leaf_flag",
+            PropertyFilter {
+                key: "email".to_string(),
+                value: Some(json!("override@example.com")),
+                operator: Some(OperatorType::Exact),
+                prop_type: PropertyType::Person,
+                group_type_index: None,
+                negation: None,
+            },
+        );
+        let independent_flag = create_test_flag_with_property(
+            99,
+            team.id,
+            "independent_flag",
+            PropertyFilter {
+                key: "email".to_string(),
+                value: Some(json!("override@example.com")),
+                operator: Some(OperatorType::Exact),
+                prop_type: PropertyType::Person,
+                group_type_index: None,
+                negation: None,
+            },
+        );
+        let parent_flag = create_test_flag_that_depends_on_flag(
+            42,
+            team.id,
+            "parent_flag",
+            leaf_flag.id,
+            FlagValue::Boolean(true),
+        );
+
+        let mut matcher = FeatureFlagMatcher::new(
+            "test_user".to_string(),
+            team.id,
+            team.project_id,
+            reader,
+            writer,
+            cohort_cache,
+            None,
+            None,
+        );
+
+        let flags = FeatureFlagList {
+            flags: vec![
+                independent_flag.clone(),
+                leaf_flag.clone(),
+                parent_flag.clone(),
+            ],
+        };
+
+        {
+            let overrides = HashMap::from([("email".to_string(), json!("override@example.com"))]);
+            let result = matcher
+                .evaluate_all_feature_flags(
+                    flags.clone(),
+                    Some(overrides),
+                    None,
+                    None,
+                    Uuid::new_v4(),
+                )
+                .await;
+            assert!(!result.errors_while_computing_flags);
+            assert_eq!(
+                result.flags.get("independent_flag").unwrap().to_value(),
+                FlagValue::Boolean(true)
+            );
+            assert_eq!(
+                result.flags.get("leaf_flag").unwrap().to_value(),
+                FlagValue::Boolean(true)
+            );
+            assert_eq!(
+                result.flags.get("parent_flag").unwrap().to_value(),
+                FlagValue::Boolean(true)
+            );
+        }
+        {
+            let result = matcher
+                .evaluate_all_feature_flags(flags.clone(), None, None, None, Uuid::new_v4())
+                .await;
+            assert!(!result.errors_while_computing_flags);
+            assert_eq!(
+                result.flags.get("independent_flag").unwrap().to_value(),
+                FlagValue::Boolean(false)
+            );
+            assert_eq!(
+                result.flags.get("leaf_flag").unwrap().to_value(),
+                FlagValue::Boolean(false)
+            );
+            assert_eq!(
+                result.flags.get("parent_flag").unwrap().to_value(),
+                FlagValue::Boolean(false)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_flags_that_depends_on_other_multivariate_flag_variant_match() {
+        let reader = setup_pg_reader_client(None).await;
+        let writer = setup_pg_writer_client(None).await;
+        let cohort_cache = Arc::new(CohortCacheManager::new(reader.clone(), None, None));
+        let team = insert_new_team_in_pg(reader.clone(), None).await.unwrap();
+
+        let leaf_flag = create_test_flag(
+            Some(2),
+            Some(team.id),
+            None,
+            Some("leaf_flag".to_string()),
+            Some(FlagFilters {
+                groups: vec![
+                    FlagPropertyGroup {
+                        properties: Some(vec![PropertyFilter {
+                            key: "email".to_string(),
+                            value: Some(json!("control@example.com")),
+                            operator: Some(OperatorType::Exact),
+                            prop_type: PropertyType::Person,
+                            group_type_index: None,
+                            negation: None,
+                        }]),
+                        rollout_percentage: Some(100.0),
+                        variant: Some("control".to_string()),
+                    },
+                    FlagPropertyGroup {
+                        properties: Some(vec![PropertyFilter {
+                            key: "email".to_string(),
+                            value: Some(json!("test@example.com")),
+                            operator: Some(OperatorType::Exact),
+                            prop_type: PropertyType::Person,
+                            group_type_index: None,
+                            negation: None,
+                        }]),
+                        rollout_percentage: Some(100.0),
+                        variant: Some("test".to_string()),
+                    },
+                    FlagPropertyGroup {
+                        properties: Some(vec![]),
+                        rollout_percentage: Some(100.0),
+                        variant: Some("other".to_string()),
+                    },
+                ],
+                multivariate: Some(MultivariateFlagOptions {
+                    variants: vec![
+                        MultivariateFlagVariant {
+                            name: None,
+                            key: "control".to_string(),
+                            rollout_percentage: 50.0,
+                        },
+                        MultivariateFlagVariant {
+                            name: None,
+                            key: "test".to_string(),
+                            rollout_percentage: 50.0,
+                        },
+                        MultivariateFlagVariant {
+                            name: None,
+                            key: "other".to_string(),
+                            rollout_percentage: 50.0,
+                        },
+                    ],
+                }),
+                aggregation_group_type_index: None,
+                payloads: None,
+                super_groups: None,
+                holdout_groups: None,
+            }),
+            None,
+            None,
+            None,
+        );
+
+        let parent_flag = create_test_flag_that_depends_on_flag(
+            1,
+            team.id,
+            "parent_flag",
+            leaf_flag.id,
+            FlagValue::String("control".to_string()),
+        );
+
+        let mut matcher = FeatureFlagMatcher::new(
+            "test_user".to_string(),
+            team.id,
+            team.project_id,
+            reader,
+            writer,
+            cohort_cache,
+            None,
+            None,
+        );
+        let flags = FeatureFlagList {
+            flags: vec![leaf_flag.clone(), parent_flag.clone()],
+        };
+
+        {
+            let overrides = HashMap::from([("email".to_string(), json!("control@example.com"))]);
+            let result = matcher
+                .evaluate_all_feature_flags(
+                    flags.clone(),
+                    Some(overrides),
+                    None,
+                    None,
+                    Uuid::new_v4(),
+                )
+                .await;
+            assert!(!result.errors_while_computing_flags);
+            assert_eq!(
+                result.flags.get("leaf_flag").unwrap().to_value(),
+                FlagValue::String("control".to_string())
+            );
+            assert_eq!(
+                result.flags.get("parent_flag").unwrap().to_value(),
+                FlagValue::Boolean(true)
+            );
+        }
+        {
+            let overrides = HashMap::from([("email".to_string(), json!("test@example.com"))]);
+            let result = matcher
+                .evaluate_all_feature_flags(
+                    flags.clone(),
+                    Some(overrides),
+                    None,
+                    None,
+                    Uuid::new_v4(),
+                )
+                .await;
+            assert!(!result.errors_while_computing_flags);
+            assert_eq!(
+                result.flags.get("leaf_flag").unwrap().to_value(),
+                FlagValue::String("test".to_string())
+            );
+            assert_eq!(
+                result.flags.get("parent_flag").unwrap().to_value(),
+                FlagValue::Boolean(false)
+            );
+        }
+        {
+            let overrides = HashMap::from([("email".to_string(), json!("random@example.com"))]);
+            let result = matcher
+                .evaluate_all_feature_flags(
+                    flags.clone(),
+                    Some(overrides),
+                    None,
+                    None,
+                    Uuid::new_v4(),
+                )
+                .await;
+            assert!(!result.errors_while_computing_flags);
+            assert_eq!(
+                result.flags.get("leaf_flag").unwrap().to_value(),
+                FlagValue::String("other".to_string())
+            );
+            assert_eq!(
+                result.flags.get("parent_flag").unwrap().to_value(),
+                FlagValue::Boolean(false)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_flags_that_depends_on_other_multivariate_flag_boolean_match() {
+        let reader = setup_pg_reader_client(None).await;
+        let writer = setup_pg_writer_client(None).await;
+        let cohort_cache = Arc::new(CohortCacheManager::new(reader.clone(), None, None));
+        let team = insert_new_team_in_pg(reader.clone(), None).await.unwrap();
+
+        let leaf_flag = create_test_flag(
+            Some(3),
+            Some(team.id),
+            None,
+            Some("leaf_flag".to_string()),
+            Some(FlagFilters {
+                groups: vec![
+                    FlagPropertyGroup {
+                        properties: Some(vec![PropertyFilter {
+                            key: "email".to_string(),
+                            value: Some(json!("control@example.com")),
+                            operator: Some(OperatorType::Exact),
+                            prop_type: PropertyType::Person,
+                            group_type_index: None,
+                            negation: None,
+                        }]),
+                        rollout_percentage: Some(100.0),
+                        variant: Some("control".to_string()),
+                    },
+                    FlagPropertyGroup {
+                        properties: Some(vec![PropertyFilter {
+                            key: "email".to_string(),
+                            value: Some(json!("test@example.com")),
+                            operator: Some(OperatorType::Exact),
+                            prop_type: PropertyType::Person,
+                            group_type_index: None,
+                            negation: None,
+                        }]),
+                        rollout_percentage: Some(100.0),
+                        variant: Some("test".to_string()),
+                    },
+                ],
+                multivariate: Some(MultivariateFlagOptions {
+                    variants: vec![
+                        MultivariateFlagVariant {
+                            name: None,
+                            key: "control".to_string(),
+                            rollout_percentage: 50.0,
+                        },
+                        MultivariateFlagVariant {
+                            name: None,
+                            key: "test".to_string(),
+                            rollout_percentage: 50.0,
+                        },
+                    ],
+                }),
+                aggregation_group_type_index: None,
+                payloads: None,
+                super_groups: None,
+                holdout_groups: None,
+            }),
+            None,
+            None,
+            None,
+        );
+
+        let parent_flag = create_test_flag_that_depends_on_flag(
+            2,
+            team.id,
+            "parent_flag",
+            leaf_flag.id,
+            FlagValue::Boolean(true), // KEY DIFFERENCE FROM PREVIOUS TEST
+        );
+
+        let mut matcher = FeatureFlagMatcher::new(
+            "test_user".to_string(),
+            team.id,
+            team.project_id,
+            reader,
+            writer,
+            cohort_cache,
+            None,
+            None,
+        );
+        let flags = FeatureFlagList {
+            flags: vec![leaf_flag.clone(), parent_flag.clone()],
+        };
+
+        {
+            let overrides = HashMap::from([("email".to_string(), json!("control@example.com"))]);
+            let result = matcher
+                .evaluate_all_feature_flags(
+                    flags.clone(),
+                    Some(overrides),
+                    None,
+                    None,
+                    Uuid::new_v4(),
+                )
+                .await;
+            assert!(!result.errors_while_computing_flags);
+            assert_eq!(
+                result.flags.get("leaf_flag").unwrap().to_value(),
+                FlagValue::String("control".to_string())
+            );
+            assert_eq!(
+                result.flags.get("parent_flag").unwrap().to_value(),
+                FlagValue::Boolean(true)
+            );
+        }
+        {
+            let overrides = HashMap::from([("email".to_string(), json!("test@example.com"))]);
+            let result = matcher
+                .evaluate_all_feature_flags(
+                    flags.clone(),
+                    Some(overrides),
+                    None,
+                    None,
+                    Uuid::new_v4(),
+                )
+                .await;
+            assert!(!result.errors_while_computing_flags);
+            assert_eq!(
+                result.flags.get("leaf_flag").unwrap().to_value(),
+                FlagValue::String("test".to_string())
+            );
+            assert_eq!(
+                result.flags.get("parent_flag").unwrap().to_value(),
+                FlagValue::Boolean(true)
+            );
+        }
+        {
+            let result = matcher
+                .evaluate_all_feature_flags(flags.clone(), None, None, None, Uuid::new_v4())
+                .await;
+            assert!(!result.errors_while_computing_flags);
+            assert_eq!(
+                result.flags.get("leaf_flag").unwrap().to_value(),
+                FlagValue::Boolean(false)
+            );
+            assert_eq!(
+                result.flags.get("parent_flag").unwrap().to_value(),
+                FlagValue::Boolean(false)
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_get_matching_variant_with_cache() {
         let flag = create_test_flag_with_variants(1);
