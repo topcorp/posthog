@@ -5,6 +5,7 @@ import { WebExperimentImplementationDetails } from 'scenes/experiments/WebExperi
 import type { CachedExperimentQueryResponse } from '~/queries/schema/schema-general'
 import { ExperimentStatsMethod } from '~/types'
 
+import { AISummary } from '../components/AISummary'
 import {
     ExploreAsInsightButton,
     ResultsBreakdown,
@@ -180,6 +181,7 @@ export function ExperimentView(): JSX.Element {
                 ) : (
                     <>
                         <Info />
+                        <AISummary experimentId={experimentId} />
                         {usesNewQueryRunner ? <ExperimentHeader /> : <LegacyExperimentHeader />}
                         <LemonTabs
                             activeKey={tabKey}
