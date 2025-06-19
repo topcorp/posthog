@@ -599,6 +599,158 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_flags_with_dependency_cycle_and_missing_dependency_still_evaluates_independent_flags(
+    ) {
+        let reader = setup_pg_reader_client(None).await;
+        let writer = setup_pg_writer_client(None).await;
+        let cohort_cache = Arc::new(CohortCacheManager::new(reader.clone(), None, None));
+        let team = insert_new_team_in_pg(reader.clone(), None).await.unwrap();
+
+        let leaf_flag = create_test_flag_with_property(
+            23,
+            team.id,
+            "leaf_flag",
+            PropertyFilter {
+                key: "email".to_string(),
+                value: Some(json!("override@example.com")),
+                operator: Some(OperatorType::Exact),
+                prop_type: PropertyType::Person,
+                group_type_index: None,
+                negation: None,
+            },
+        );
+        let independent_flag = create_test_flag_with_property(
+            99,
+            team.id,
+            "independent_flag",
+            PropertyFilter {
+                key: "email".to_string(),
+                value: Some(json!("override@example.com")),
+                operator: Some(OperatorType::Exact),
+                prop_type: PropertyType::Person,
+                group_type_index: None,
+                negation: None,
+            },
+        );
+        let parent_flag = create_test_flag_that_depends_on_flag(
+            42,
+            team.id,
+            "parent_flag",
+            leaf_flag.id,
+            FlagValue::Boolean(true),
+        );
+
+        let cycle_node = create_test_flag_that_depends_on_flag(
+            43,
+            team.id,
+            "self_referencing_flag",
+            44,
+            FlagValue::Boolean(true),
+        );
+
+        let cycle_middle_flag = create_test_flag_that_depends_on_flag(
+            44,
+            team.id,
+            "cycle_start_flag",
+            45,
+            FlagValue::Boolean(true),
+        );
+
+        let cycle_start_flag = create_test_flag_that_depends_on_flag(
+            45,
+            team.id,
+            "cycle_start_flag",
+            43,
+            FlagValue::Boolean(true),
+        );
+
+        let missing_dependency_flag = create_test_flag_that_depends_on_flag(
+            46,
+            team.id,
+            "missing_dependency_flag",
+            999,
+            FlagValue::Boolean(true),
+        );
+
+        let mut matcher = FeatureFlagMatcher::new(
+            "test_user".to_string(),
+            team.id,
+            team.project_id,
+            reader,
+            writer,
+            cohort_cache,
+            None,
+            None,
+        );
+
+        let flags = FeatureFlagList {
+            flags: vec![
+                independent_flag.clone(),
+                leaf_flag.clone(),
+                cycle_node.clone(),
+                cycle_middle_flag.clone(),
+                cycle_start_flag.clone(),
+                parent_flag.clone(),
+                missing_dependency_flag.clone(),
+            ],
+        };
+
+        {
+            // Leaf flag evaluates to true
+            let overrides = HashMap::from([("email".to_string(), json!("override@example.com"))]);
+            let result = matcher
+                .evaluate_all_feature_flags(
+                    flags.clone(),
+                    Some(overrides),
+                    None,
+                    None,
+                    Uuid::new_v4(),
+                )
+                .await;
+            assert!(result.errors_while_computing_flags);
+            assert_eq!(
+                result.flags.get("independent_flag").unwrap().to_value(),
+                FlagValue::Boolean(true)
+            );
+            assert_eq!(
+                result.flags.get("leaf_flag").unwrap().to_value(),
+                FlagValue::Boolean(true)
+            );
+            assert_eq!(
+                result.flags.get("parent_flag").unwrap().to_value(),
+                FlagValue::Boolean(true)
+            );
+            assert!(result.flags.get("cycle_start_flag").is_none());
+            assert!(result.flags.get("cycle_middle_flag").is_none());
+            assert!(result.flags.get("cycle_node").is_none());
+            assert!(result.flags.get("missing_dependency_flag").is_none());
+        }
+        {
+            // Leaf flag evaluates to false
+            let result = matcher
+                .evaluate_all_feature_flags(flags.clone(), None, None, None, Uuid::new_v4())
+                .await;
+            assert!(result.errors_while_computing_flags);
+            assert_eq!(
+                result.flags.get("independent_flag").unwrap().to_value(),
+                FlagValue::Boolean(false)
+            );
+            assert_eq!(
+                result.flags.get("leaf_flag").unwrap().to_value(),
+                FlagValue::Boolean(false)
+            );
+            assert_eq!(
+                result.flags.get("parent_flag").unwrap().to_value(),
+                FlagValue::Boolean(false)
+            );
+            assert!(result.flags.get("cycle_start_flag").is_none());
+            assert!(result.flags.get("cycle_middle_flag").is_none());
+            assert!(result.flags.get("cycle_node").is_none());
+            assert!(result.flags.get("missing_dependency_flag").is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn test_flags_that_depends_on_other_multivariate_flag_boolean_match() {
         let reader = setup_pg_reader_client(None).await;
         let writer = setup_pg_writer_client(None).await;
@@ -684,6 +836,7 @@ mod tests {
         };
 
         {
+            // Leaf flag evaluates to "control"
             let overrides = HashMap::from([("email".to_string(), json!("control@example.com"))]);
             let result = matcher
                 .evaluate_all_feature_flags(
@@ -705,6 +858,7 @@ mod tests {
             );
         }
         {
+            // Leaf flag evaluates to "test"
             let overrides = HashMap::from([("email".to_string(), json!("test@example.com"))]);
             let result = matcher
                 .evaluate_all_feature_flags(
@@ -726,6 +880,7 @@ mod tests {
             );
         }
         {
+            // Leaf flag evaluates to false
             let result = matcher
                 .evaluate_all_feature_flags(flags.clone(), None, None, None, Uuid::new_v4())
                 .await;
