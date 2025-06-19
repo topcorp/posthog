@@ -1846,6 +1846,12 @@ class RevenueAnalyticsOverviewItemKey(StrEnum):
     AVG_REVENUE_PER_CUSTOMER = "avg_revenue_per_customer"
 
 
+class RevenueAnalyticsPersonsJoinMode(StrEnum):
+    ID = "id"
+    EMAIL = "email"
+    CUSTOM = "custom"
+
+
 class RevenueAnalyticsTopCustomersGroupBy(StrEnum):
     MONTH = "month"
     ALL = "all"
@@ -7469,6 +7475,8 @@ class RevenueAnalyticsConfig(BaseModel):
     events: Optional[list[RevenueAnalyticsEventItem]] = []
     filter_test_accounts: Optional[bool] = False
     goals: Optional[list[RevenueAnalyticsGoal]] = []
+    persons_join_mode: Optional[RevenueAnalyticsPersonsJoinMode] = RevenueAnalyticsPersonsJoinMode.ID
+    persons_join_mode_custom: Optional[str] = None
 
 
 class RevenueAnalyticsGrowthRateQuery(BaseModel):
