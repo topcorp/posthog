@@ -1,1 +1,1 @@
-0773_teamrevenueanalyticsconfig_persons_join_mode_and_more
+0772_alter_externaldataschema_sync_type

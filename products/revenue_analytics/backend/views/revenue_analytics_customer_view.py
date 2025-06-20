@@ -21,7 +21,10 @@ from .revenue_analytics_base_view import events_exprs_for_team
 from posthog.hogql.database.schema.exchange_rate import (
     revenue_comparison_and_value_exprs_for_events,
 )
-from posthog.schema import RevenueAnalyticsPersonsJoinMode
+from posthog.schema import (
+    RevenueAnalyticsPersonsJoinMode,
+    HogQLQueryModifiers,
+)
 
 SOURCE_VIEW_SUFFIX = "customer_revenue_view"
 EVENTS_VIEW_SUFFIX = "customer_revenue_view_events"
@@ -50,7 +53,7 @@ class RevenueAnalyticsCustomerView(RevenueAnalyticsBaseView):
 
     # No customer views for events, we only have that for schema sources
     @classmethod
-    def for_events(cls, team: Team) -> list["RevenueAnalyticsBaseView"]:
+    def for_events(cls, team: Team, _modifiers: HogQLQueryModifiers) -> list["RevenueAnalyticsBaseView"]:
         if len(team.revenue_analytics_config.events) == 0:
             return []
 
@@ -100,7 +103,9 @@ class RevenueAnalyticsCustomerView(RevenueAnalyticsBaseView):
         ]
 
     @classmethod
-    def for_schema_source(cls, source: ExternalDataSource, team: Team) -> list["RevenueAnalyticsBaseView"]:
+    def for_schema_source(
+        cls, source: ExternalDataSource, modifiers: HogQLQueryModifiers
+    ) -> list["RevenueAnalyticsBaseView"]:
         # Currently only works for stripe sources
         if not source.source_type == ExternalDataSource.Type.STRIPE:
             return []
@@ -152,7 +157,7 @@ class RevenueAnalyticsCustomerView(RevenueAnalyticsBaseView):
                 ast.Alias(alias="cohort", expr=ast.Constant(value=None)),
                 ast.Alias(alias="initial_coupon", expr=ast.Constant(value=None)),
                 ast.Alias(alias="initial_coupon_id", expr=ast.Constant(value=None)),
-                ast.Alias(alias="distinct_id", expr=cls._schema_source_distinct_id_expr(team)),
+                ast.Alias(alias="distinct_id", expr=cls._schema_source_distinct_id_expr(modifiers)),
             ],
             select_from=ast.JoinExpr(alias="outer", table=ast.Field(chain=[table.name])),
         )
@@ -229,16 +234,21 @@ class RevenueAnalyticsCustomerView(RevenueAnalyticsBaseView):
         ]
 
     @classmethod
-    def _schema_source_distinct_id_expr(cls, team: Team) -> ast.Expr:
-        config = team.revenue_analytics_config
-        if config.persons_join_mode == RevenueAnalyticsPersonsJoinMode.ID:
+    def _schema_source_distinct_id_expr(cls, modifiers: HogQLQueryModifiers) -> ast.Expr:
+        if modifiers.revenueAnalyticsPersonsJoinMode == RevenueAnalyticsPersonsJoinMode.ID:
             return ast.Field(chain=["id"])
-        elif config.persons_join_mode == RevenueAnalyticsPersonsJoinMode.EMAIL:
+        elif modifiers.revenueAnalyticsPersonsJoinMode == RevenueAnalyticsPersonsJoinMode.EMAIL:
             return ast.Field(chain=["email"])
-        elif config.persons_join_mode == RevenueAnalyticsPersonsJoinMode.CUSTOM and config.persons_join_mode_custom:
+        elif (
+            modifiers.revenueAnalyticsPersonsJoinMode == RevenueAnalyticsPersonsJoinMode.CUSTOM
+            and modifiers.revenueAnalyticsPersonsJoinModeCustom
+        ):
             return ast.Call(
                 name="JSONExtractString",
-                args=[ast.Field(chain=["metadata"]), ast.Constant(value=config.persons_join_mode_custom)],
+                args=[
+                    ast.Field(chain=["metadata"]),
+                    ast.Constant(value=modifiers.revenueAnalyticsPersonsJoinModeCustom),
+                ],
             )
         else:
             return ast.Field(chain=["id"])  # Fallback to ID, should never happen
