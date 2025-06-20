@@ -21,6 +21,7 @@ from .revenue_analytics_base_view import events_exprs_for_team
 from posthog.hogql.database.schema.exchange_rate import (
     revenue_comparison_and_value_exprs_for_events,
 )
+from posthog.schema import RevenueAnalyticsPersonsJoinMode
 
 SOURCE_VIEW_SUFFIX = "customer_revenue_view"
 EVENTS_VIEW_SUFFIX = "customer_revenue_view_events"
@@ -38,6 +39,7 @@ FIELDS: dict[str, FieldOrTable] = {
     "cohort": StringDatabaseField(name="cohort"),
     "initial_coupon": StringDatabaseField(name="initial_coupon"),
     "initial_coupon_id": StringDatabaseField(name="initial_coupon_id"),
+    "distinct_id": StringDatabaseField(name="distinct_id"),
 }
 
 
@@ -48,7 +50,7 @@ class RevenueAnalyticsCustomerView(RevenueAnalyticsBaseView):
 
     # No customer views for events, we only have that for schema sources
     @classmethod
-    def for_events(cls, team: "Team") -> list["RevenueAnalyticsBaseView"]:
+    def for_events(cls, team: Team) -> list["RevenueAnalyticsBaseView"]:
         if len(team.revenue_analytics_config.events) == 0:
             return []
 
@@ -76,6 +78,7 @@ class RevenueAnalyticsCustomerView(RevenueAnalyticsBaseView):
                     ast.Alias(alias="cohort", expr=ast.Constant(value=None)),
                     ast.Alias(alias="initial_coupon", expr=ast.Constant(value=None)),
                     ast.Alias(alias="initial_coupon_id", expr=ast.Constant(value=None)),
+                    ast.Alias(alias="distinct_id", expr=ast.Field(chain=["distinct_id"])),
                 ],
                 select_from=ast.JoinExpr(table=ast.Field(chain=["events"])),
                 where=ast.And(exprs=[comparison_expr, *generic_team_exprs]),
@@ -97,7 +100,7 @@ class RevenueAnalyticsCustomerView(RevenueAnalyticsBaseView):
         ]
 
     @classmethod
-    def for_schema_source(cls, source: ExternalDataSource) -> list["RevenueAnalyticsBaseView"]:
+    def for_schema_source(cls, source: ExternalDataSource, team: Team) -> list["RevenueAnalyticsBaseView"]:
         # Currently only works for stripe sources
         if not source.source_type == ExternalDataSource.Type.STRIPE:
             return []
@@ -149,6 +152,7 @@ class RevenueAnalyticsCustomerView(RevenueAnalyticsBaseView):
                 ast.Alias(alias="cohort", expr=ast.Constant(value=None)),
                 ast.Alias(alias="initial_coupon", expr=ast.Constant(value=None)),
                 ast.Alias(alias="initial_coupon_id", expr=ast.Constant(value=None)),
+                ast.Alias(alias="distinct_id", expr=cls._schema_source_distinct_id_expr(team)),
             ],
             select_from=ast.JoinExpr(alias="outer", table=ast.Field(chain=[table.name])),
         )
@@ -187,7 +191,7 @@ class RevenueAnalyticsCustomerView(RevenueAnalyticsBaseView):
                     alias="cohort_inner",
                     table=ast.SelectQuery(
                         select=[
-                            ast.Field(chain=["customer_id"]),
+                            ast.Field(chain=["invoice", "customer_id"]),
                             ast.Alias(alias="cohort", expr=parse_expr("toStartOfMonth(min(created_at))")),
                             ast.Alias(alias="cohort_readable", expr=parse_expr("formatDateTime(cohort, '%Y-%m')")),
                             ast.Alias(
@@ -200,7 +204,7 @@ class RevenueAnalyticsCustomerView(RevenueAnalyticsBaseView):
                             ),
                         ],
                         select_from=ast.JoinExpr(alias="invoice", table=ast.Field(chain=[invoice_table.name])),
-                        group_by=[ast.Field(chain=["customer_id"])],
+                        group_by=[ast.Field(chain=["invoice", "customer_id"])],
                     ),
                     join_type="LEFT JOIN",
                     constraint=ast.JoinConstraint(
@@ -223,3 +227,18 @@ class RevenueAnalyticsCustomerView(RevenueAnalyticsBaseView):
                 source_id=str(source.id),
             )
         ]
+
+    @classmethod
+    def _schema_source_distinct_id_expr(cls, team: Team) -> ast.Expr:
+        config = team.revenue_analytics_config
+        if config.persons_join_mode == RevenueAnalyticsPersonsJoinMode.ID:
+            return ast.Field(chain=["id"])
+        elif config.persons_join_mode == RevenueAnalyticsPersonsJoinMode.EMAIL:
+            return ast.Field(chain=["email"])
+        elif config.persons_join_mode == RevenueAnalyticsPersonsJoinMode.CUSTOM and config.persons_join_mode_custom:
+            return ast.Call(
+                name="JSONExtractString",
+                args=[ast.Field(chain=["metadata"]), ast.Constant(value=config.persons_join_mode_custom)],
+            )
+        else:
+            return ast.Field(chain=["id"])  # Fallback to ID, should never happen
