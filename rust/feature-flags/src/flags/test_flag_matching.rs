@@ -660,7 +660,7 @@ mod tests {
         let cycle_middle_flag = create_test_flag_that_depends_on_flag(
             44,
             team.id,
-            "cycle_start_flag",
+            "cycle_middle_flag",
             45,
             FlagValue::Boolean(true),
         );
