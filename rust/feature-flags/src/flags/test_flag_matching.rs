@@ -417,8 +417,13 @@ mod tests {
                 result.flags.get("parent_flag").unwrap().to_value(),
                 FlagValue::Boolean(true)
             );
+            assert!(!result.flags.contains_key("cycle_start_flag"));
+            assert!(!result.flags.contains_key("cycle_middle_flag"));
+            assert!(!result.flags.contains_key("cycle_node"));
+            assert!(!result.flags.contains_key("missing_dependency_flag"));
         }
         {
+            // Leaf flag evaluates to false
             let result = matcher
                 .evaluate_all_feature_flags(flags.clone(), None, None, None, Uuid::new_v4())
                 .await;
@@ -435,6 +440,10 @@ mod tests {
                 result.flags.get("parent_flag").unwrap().to_value(),
                 FlagValue::Boolean(false)
             );
+            assert!(!result.flags.contains_key("cycle_start_flag"));
+            assert!(!result.flags.contains_key("cycle_middle_flag"));
+            assert!(!result.flags.contains_key("cycle_node"));
+            assert!(!result.flags.contains_key("missing_dependency_flag"));
         }
     }
 
@@ -720,10 +729,10 @@ mod tests {
                 result.flags.get("parent_flag").unwrap().to_value(),
                 FlagValue::Boolean(true)
             );
-            assert!(result.flags.get("cycle_start_flag").is_none());
-            assert!(result.flags.get("cycle_middle_flag").is_none());
-            assert!(result.flags.get("cycle_node").is_none());
-            assert!(result.flags.get("missing_dependency_flag").is_none());
+            assert!(!result.flags.contains_key("cycle_start_flag"));
+            assert!(!result.flags.contains_key("cycle_middle_flag"));
+            assert!(!result.flags.contains_key("cycle_node"));
+            assert!(!result.flags.contains_key("missing_dependency_flag"));
         }
         {
             // Leaf flag evaluates to false
@@ -743,10 +752,10 @@ mod tests {
                 result.flags.get("parent_flag").unwrap().to_value(),
                 FlagValue::Boolean(false)
             );
-            assert!(result.flags.get("cycle_start_flag").is_none());
-            assert!(result.flags.get("cycle_middle_flag").is_none());
-            assert!(result.flags.get("cycle_node").is_none());
-            assert!(result.flags.get("missing_dependency_flag").is_none());
+            assert!(!result.flags.contains_key("cycle_start_flag"));
+            assert!(!result.flags.contains_key("cycle_middle_flag"));
+            assert!(!result.flags.contains_key("cycle_node"));
+            assert!(!result.flags.contains_key("missing_dependency_flag"));
         }
     }
 
