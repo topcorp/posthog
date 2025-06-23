@@ -35,6 +35,7 @@ from posthog.models import (
 )
 from posthog.permissions import CanCreateOrg
 from posthog.utils import get_can_create_org, is_relative_url
+from posthog.helpers.email_utils import EmailValidationHelper
 
 logger = structlog.get_logger(__name__)
 
@@ -107,6 +108,11 @@ class SignupSerializer(serializers.Serializer):
             password_validation.validate_password(value)
         return value
 
+    def validate_email(self, value):
+        if EmailValidationHelper.user_exists(value):
+            raise serializers.ValidationError("There is already an account with this email address.", code="unique")
+        return value
+
     def is_email_auto_verified(self):
         return self.is_social_signup
 
@@ -115,6 +121,14 @@ class SignupSerializer(serializers.Serializer):
             return self.enter_demo(validated_data)
 
         is_instance_first_user: bool = not User.objects.exists()
+
+        email = validated_data.get("email", "")
+        user_exists = EmailValidationHelper.user_exists(email)
+        if user_exists:
+            raise exceptions.ValidationError(
+                {"email": "There is already an account with this email address."},
+                code="unique",
+            )
 
         organization_name = validated_data.pop("organization_name", f"{validated_data['first_name']}'s Organization")
         role_at_organization = validated_data.pop("role_at_organization", "")
@@ -130,6 +144,7 @@ class SignupSerializer(serializers.Serializer):
                 **validated_data,
             )
         except IntegrityError:
+            # This should be rare now due to the check above, but kept for safety
             raise exceptions.ValidationError(
                 {"email": "There is already an account with this email address."},
                 code="unique",
