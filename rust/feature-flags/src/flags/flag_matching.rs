@@ -425,7 +425,12 @@ impl FeatureFlagMatcher {
             match DependencyGraph::from_nodes(&feature_flags.flags) {
                 Ok((graph, errors)) => (graph, errors),
                 Err(e) => {
-                    error!("Failed to build feature flag dependency graph for team {}: {:?}", team_id, e);
+                    error!("Failed to build feature flag dependency graph for team {}: {:?}", self.team_id, e);
+                    inc(
+                        FLAG_EVALUATION_ERROR_COUNTER,
+                        &[("reason".to_string(), "dependency_graph_error".to_string())],
+                        1,
+                    );
                     return FlagsResponse {
                         errors_while_computing_flags: true,
                         flags: HashMap::new(),
@@ -438,8 +443,12 @@ impl FeatureFlagMatcher {
 
         if !errors.is_empty() {
             errors_while_computing_flags = true;
-            // TODO: Make sure this call reports a useful error message.
-            error!("There were errors building the feature flag dependency graph. Will attempt to evaluate the rest of the flags: {:?}", errors);
+            inc(
+                FLAG_EVALUATION_ERROR_COUNTER,
+                &[("reason".to_string(), "dependency_graph_error".to_string())],
+                1,
+            );
+            error!("There were errors building the feature flag dependency graph for team {}. Will attempt to evaluate the rest of the flags: {:?}", self.team_id, errors);
         }
 
         let mut flag_details_map = HashMap::new();
