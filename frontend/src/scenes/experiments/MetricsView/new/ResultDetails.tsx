@@ -1,6 +1,5 @@
 import { IconRewindPlay } from '@posthog/icons'
-import { LemonTable, LemonTableColumns } from '@posthog/lemon-ui'
-import { LemonButton } from '@posthog/lemon-ui'
+import { LemonButton, LemonTable, LemonTableColumns } from '@posthog/lemon-ui'
 import { router } from 'kea-router'
 import { humanFriendlyNumber } from 'lib/utils'
 import posthog from 'posthog-js'
@@ -10,11 +9,10 @@ import { ResultsQuery } from 'scenes/experiments/components/ResultsBreakdown/Res
 import { getViewRecordingFilters } from 'scenes/experiments/utils'
 import { urls } from 'scenes/urls'
 
-import { ExperimentMetric } from '~/queries/schema/schema-general'
-import { CachedExperimentQueryResponse } from '~/queries/schema/schema-general'
-import { FilterLogicalOperator, RecordingUniversalFilters, ReplayTabs } from '~/types'
-import { Experiment } from '~/types'
+import { CachedExperimentQueryResponse, ExperimentMetric } from '~/queries/schema/schema-general'
+import { Experiment, FilterLogicalOperator, RecordingUniversalFilters, ReplayTabs } from '~/types'
 
+import { ResultsInsightInfoBanner } from 'scenes/experiments/components/ResultsBreakdown/ResultsInsightInfoBanner'
 import { formatPValue } from '../shared/utils'
 
 export function ResultDetails({
@@ -131,12 +129,15 @@ export function ResultDetails({
             <LemonTable columns={columns} dataSource={dataSource} loading={false} />
             {metric.metric_type === 'funnel' && (
                 <ResultsBreakdown result={result} experiment={experiment}>
-                    {({ query, breakdownResultsLoading, breakdownResults }) => {
+                    {({ query, breakdownResultsLoading, breakdownResults, exposureDifference }) => {
                         return (
                             <>
                                 {breakdownResultsLoading && <ResultsBreakdownSkeleton />}
                                 {query && breakdownResults && (
-                                    <ResultsQuery query={query} breakdownResults={breakdownResults} />
+                                    <>
+                                        <ResultsInsightInfoBanner exposureDifference={exposureDifference} />
+                                        <ResultsQuery query={query} breakdownResults={breakdownResults} />
+                                    </>
                                 )}
                             </>
                         )
