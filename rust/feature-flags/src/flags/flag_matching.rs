@@ -452,7 +452,19 @@ impl FeatureFlagMatcher {
         }
 
         let mut flag_details_map = HashMap::new();
-        let evaluation_stages = flag_dependency_graph.evaluation_stages().unwrap();
+        let evaluation_stages = match flag_dependency_graph.evaluation_stages() {
+            Ok(stages) => stages,
+            Err(e) => {
+                error!("Failed to get evaluation stages for team {}: {:?}", self.team_id, e);
+                inc(
+                    FLAG_EVALUATION_ERROR_COUNTER,
+                    &[("reason".to_string(), "evaluation_stages_error".to_string())],
+                    1,
+                );
+                errors_while_computing_flags = true;
+                Vec::new() // Return an empty vector to allow the program to continue
+            }
+        };
         for stage in evaluation_stages {
             let stage_flags: Vec<FeatureFlag> = stage.iter().map(|&flag| flag.clone()).collect();
             let (level_flag_details_map, level_errors) = self
