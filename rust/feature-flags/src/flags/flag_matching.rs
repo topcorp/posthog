@@ -425,7 +425,7 @@ impl FeatureFlagMatcher {
             match DependencyGraph::from_nodes(&feature_flags.flags) {
                 Ok((graph, errors)) => (graph, errors),
                 Err(e) => {
-                    error!("Failed to build feature flag dependency graph: {:?}", e);
+                    error!("Failed to build feature flag dependency graph for team {}: {:?}", team_id, e);
                     return FlagsResponse {
                         errors_while_computing_flags: true,
                         flags: HashMap::new(),
