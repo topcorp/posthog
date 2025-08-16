@@ -4,6 +4,7 @@ import collections.abc
 import datetime as dt
 import math
 import operator
+import time
 import typing
 import uuid
 
@@ -60,6 +61,73 @@ from products.batch_exports.backend.temporal.utils import (
 
 LOGGER = get_logger(__name__)
 EXTERNAL_LOGGER = get_external_logger()
+
+
+class DynamicBatchSizer:
+    """Manages dynamic batch size adjustments based on performance metrics."""
+    
+    def __init__(
+        self, 
+        initial_batch_size: int = 1000,
+        min_batch_size: int | None = None,
+        max_batch_size: int | None = None,
+        adjustment_factor: float | None = None,
+        performance_threshold: float | None = None,
+    ):
+        self.current_batch_size = initial_batch_size
+        self.min_batch_size = min_batch_size or getattr(settings, 'BATCH_EXPORT_MIN_BATCH_SIZE', 100)
+        self.max_batch_size = max_batch_size or getattr(settings, 'BATCH_EXPORT_MAX_BATCH_SIZE', 10000)
+        self.adjustment_factor = adjustment_factor or getattr(settings, 'BATCH_EXPORT_BATCH_SIZE_ADJUSTMENT_FACTOR', 1.2)
+        self.performance_threshold = performance_threshold or getattr(settings, 'BATCH_EXPORT_PERFORMANCE_THRESHOLD_RPS', 1000.0)
+        self.enabled = getattr(settings, 'BATCH_EXPORT_DYNAMIC_BATCH_SIZE_ENABLED', False)
+        
+        self.performance_history: list[float] = []
+        self.batch_history: list[int] = []
+        self.last_adjustment_time = time.time()
+        
+    def should_adjust(self) -> bool:
+        """Check if enough time has passed since last adjustment."""
+        return self.enabled and (time.time() - self.last_adjustment_time) > 60  # Adjust at most once per minute
+        
+    def record_performance(self, records_processed: int, duration_seconds: float) -> None:
+        """Record performance metrics and potentially adjust batch size."""
+        if not self.enabled or duration_seconds <= 0:
+            return
+            
+        records_per_second = records_processed / duration_seconds
+        self.performance_history.append(records_per_second)
+        self.batch_history.append(self.current_batch_size)
+        
+        # Keep only recent history (last 10 measurements)
+        self.performance_history = self.performance_history[-10:]
+        self.batch_history = self.batch_history[-10:]
+        
+        if self.should_adjust() and len(self.performance_history) >= 3:
+            self._adjust_batch_size(records_per_second)
+            
+    def _adjust_batch_size(self, current_rps: float) -> None:
+        """Adjust batch size based on current performance."""
+        avg_rps = sum(self.performance_history) / len(self.performance_history)
+        
+        if avg_rps < self.performance_threshold * 0.8:  # Performance below 80% of threshold
+            # Decrease batch size to improve performance
+            new_size = max(self.min_batch_size, int(self.current_batch_size / self.adjustment_factor))
+            if new_size != self.current_batch_size:
+                LOGGER.info(f"Decreasing batch size from {self.current_batch_size} to {new_size} (RPS: {avg_rps:.2f})")
+                self.current_batch_size = new_size
+                
+        elif avg_rps > self.performance_threshold * 1.2:  # Performance above 120% of threshold
+            # Increase batch size to handle more data
+            new_size = min(self.max_batch_size, int(self.current_batch_size * self.adjustment_factor))
+            if new_size != self.current_batch_size:
+                LOGGER.info(f"Increasing batch size from {self.current_batch_size} to {new_size} (RPS: {avg_rps:.2f})")
+                self.current_batch_size = new_size
+                
+        self.last_adjustment_time = time.time()
+        
+    def get_batch_size(self) -> int:
+        """Get current optimal batch size."""
+        return self.current_batch_size
 
 
 class RecordBatchQueue(asyncio.Queue):
@@ -206,6 +274,7 @@ class Consumer:
         self.writer_format = writer_format
         self.logger = LOGGER.bind(writer_format=writer_format)
         self.external_logger = EXTERNAL_LOGGER.bind(writer_format=writer_format)
+        self.batch_sizer = DynamicBatchSizer()
 
     @property
     def rows_exported_counter(self) -> temporalio.common.MetricCounter:
@@ -317,6 +386,7 @@ class Consumer:
         record_batches_count = 0
         record_batches_count_total = 0
         records_count = 0
+        batch_start_time = time.time()
 
         self.logger.info("Consuming record batches directly from ClickHouse")
 
@@ -334,7 +404,13 @@ class Consumer:
                     "Flushing %d records from %d record batches", writer.records_since_last_flush, record_batches_count
                 )
 
-                records_count += writer.records_since_last_flush
+                records_in_batch = writer.records_since_last_flush
+                records_count += records_in_batch
+
+                # Record performance metrics for dynamic batch sizing
+                batch_duration = time.time() - batch_start_time
+                if batch_duration > 0:
+                    self.batch_sizer.record_performance(records_in_batch, batch_duration)
 
                 if multiple_files or writer.should_hard_flush():
                     await writer.hard_flush()
@@ -344,6 +420,7 @@ class Consumer:
                 for _ in range(record_batches_count):
                     queue.task_done()
                 record_batches_count = 0
+                batch_start_time = time.time()  # Reset for next batch
 
             self.heartbeater.set_from_heartbeat_details(self.heartbeat_details)
 
@@ -371,20 +448,39 @@ class Consumer:
         producer_task: asyncio.Task,
     ):
         """Yield record batches from provided `queue` until `producer_task` is done."""
-        while True:
-            try:
-                record_batch = queue.get_nowait()
-            except asyncio.QueueEmpty:
-                if producer_task.done():
-                    self.logger.debug(
-                        "Empty queue with no more events being produced, closing writer loop and flushing"
-                    )
-                    break
-                else:
-                    await asyncio.sleep(0)
-                    continue
+        try:
+            while True:
+                try:
+                    record_batch = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    if producer_task.done():
+                        self.logger.debug(
+                            "Empty queue with no more events being produced, closing writer loop and flushing"
+                        )
+                        break
+                    else:
+                        await asyncio.sleep(0)
+                        continue
+                except Exception as e:
+                    self.logger.error("Unexpected error getting record batch from queue: %s", str(e), exc_info=True)
+                    raise
 
-            yield record_batch
+                try:
+                    yield record_batch
+                except GeneratorExit:
+                    self.logger.debug("Generator closed by consumer")
+                    break
+                except Exception as e:
+                    self.logger.error("Error yielding record batch: %s", str(e), exc_info=True)
+                    raise
+        except asyncio.CancelledError:
+            self.logger.debug("Record batch generator was cancelled")
+            raise
+        except Exception as e:
+            self.logger.error("Unexpected error in record batch generator: %s", str(e), exc_info=True)
+            raise
+        finally:
+            self.logger.debug("Record batch generator cleanup completed")
 
     def complete_heartbeat(self):
         """Complete this consumer's heartbeats."""
@@ -570,6 +666,7 @@ class Producer:
         self.model = model
         self.logger = LOGGER.bind()
         self._task: asyncio.Task | None = None
+        self.batch_sizer = DynamicBatchSizer()
 
     @property
     def task(self) -> asyncio.Task:
@@ -813,11 +910,31 @@ class Producer:
                     async for record_batch in client.astream_query_as_arrow(
                         query, query_parameters=query_parameters, query_id=str(query_id)
                     ):
-                        for record_batch_slice in slice_record_batch(
-                            record_batch, max_record_batch_size_bytes, min_records_per_batch
-                        ):
+                        try:
+                            # Use dynamic batch sizing if enabled
+                            effective_min_records = min_records_per_batch
+                            if self.batch_sizer.enabled:
+                                effective_min_records = min(self.batch_sizer.get_batch_size(), min_records_per_batch)
+                                
+                            for record_batch_slice in slice_record_batch(
+                                record_batch, max_record_batch_size_bytes, effective_min_records
+                            ):
+                                await queue.put(record_batch_slice)
+                        except asyncio.QueueFull as e:
+                            self.logger.warning("Queue is full, waiting before retrying: %s", str(e))
+                            await asyncio.sleep(0.1)
+                            # Retry the put operation
                             await queue.put(record_batch_slice)
+                        except Exception as e:
+                            self.logger.error("Error processing record batch slice: %s", str(e), exc_info=True)
+                            raise
 
+                except asyncio.CancelledError:
+                    self.logger.info("Producer was cancelled during query execution")
+                    raise
+                except ConnectionError as e:
+                    self.logger.error("Database connection error during record batch production: %s", str(e))
+                    raise
                 except Exception as e:
                     self.logger.exception("Unexpected error occurred while producing record batches", exc_info=e)
                     raise

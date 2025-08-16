@@ -57,3 +57,10 @@ BATCH_EXPORT_INTERNAL_STAGING_BUCKET: str = os.getenv("BATCH_EXPORT_INTERNAL_STA
 # The number of partitions controls how many files ClickHouse writes to concurrently
 BATCH_EXPORT_CLICKHOUSE_S3_PARTITIONS: int = get_from_env("BATCH_EXPORT_CLICKHOUSE_S3_PARTITIONS", 5, type_cast=int)
 BATCH_EXPORT_TRANSFORMER_MAX_WORKERS: int = get_from_env("BATCH_EXPORT_TRANSFORMER_MAX_WORKERS", 2, type_cast=int)
+
+# Dynamic batch size settings
+BATCH_EXPORT_DYNAMIC_BATCH_SIZE_ENABLED: bool = get_from_env("BATCH_EXPORT_DYNAMIC_BATCH_SIZE_ENABLED", False, type_cast=bool)
+BATCH_EXPORT_MIN_BATCH_SIZE: int = get_from_env("BATCH_EXPORT_MIN_BATCH_SIZE", 100, type_cast=int)  
+BATCH_EXPORT_MAX_BATCH_SIZE: int = get_from_env("BATCH_EXPORT_MAX_BATCH_SIZE", 10000, type_cast=int)
+BATCH_EXPORT_BATCH_SIZE_ADJUSTMENT_FACTOR: float = get_from_env("BATCH_EXPORT_BATCH_SIZE_ADJUSTMENT_FACTOR", 1.2, type_cast=float)
+BATCH_EXPORT_PERFORMANCE_THRESHOLD_RPS: float = get_from_env("BATCH_EXPORT_PERFORMANCE_THRESHOLD_RPS", 1000.0, type_cast=float)

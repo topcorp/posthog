@@ -1,10 +1,12 @@
 import datetime as dt
 import json
+import time
 from dataclasses import dataclass
 from uuid import UUID
 
 from temporalio import activity, workflow
 from temporalio.common import RetryPolicy
+import temporalio.common
 
 from posthog.batch_exports.models import BatchExport, BatchExportRun
 from posthog.batch_exports.service import (
@@ -18,6 +20,20 @@ from posthog.temporal.common.heartbeat import Heartbeater
 from posthog.temporal.common.logger import bind_contextvars, get_logger
 
 LOGGER = get_logger(__name__)
+
+# Performance monitoring metrics
+BATCH_EXPORT_MONITORING_DURATION_HISTOGRAM = temporalio.common.MetricHistogram(
+    name="batch_export_monitoring_duration_seconds", 
+    description="Duration of batch export monitoring workflow"
+)
+BATCH_EXPORT_MONITORING_PERFORMANCE_GAUGE = temporalio.common.MetricGauge(
+    name="batch_export_monitoring_performance_score",
+    description="Performance score for batch export monitoring (records processed per second)"
+)
+BATCH_EXPORT_MONITORING_THROUGHPUT_GAUGE = temporalio.common.MetricGauge(
+    name="batch_export_monitoring_throughput_bytes_per_second", 
+    description="Throughput of batch export monitoring in bytes per second"
+)
 
 
 def datetime_to_str(dt_obj: dt.datetime) -> str:
@@ -362,6 +378,9 @@ class BatchExportMonitoringWorkflow(PostHogWorkflow):
         bind_contextvars(batch_export_id=inputs.batch_export_id)
         logger = LOGGER.bind()
         logger.info("Starting batch exports monitoring workflow")
+        
+        # Start performance monitoring
+        start_time = time.time()
 
         batch_export_details = await workflow.execute_activity(
             get_batch_export,
@@ -423,10 +442,32 @@ class BatchExportMonitoringWorkflow(PostHogWorkflow):
             heartbeat_timeout=dt.timedelta(minutes=1),
         )
 
-        return await workflow.execute_activity(
+        total_rows_updated = await workflow.execute_activity(
             update_batch_export_runs,
             UpdateBatchExportRunsInputs(batch_export_id=batch_export_details.id, results=clickhouse_event_counts),
             start_to_close_timeout=dt.timedelta(hours=1),
             retry_policy=RetryPolicy(maximum_attempts=3, initial_interval=dt.timedelta(seconds=20)),
             heartbeat_timeout=dt.timedelta(minutes=1),
         )
+
+        # Record performance metrics
+        end_time = time.time()
+        duration_seconds = end_time - start_time
+        total_records = sum(count.count for count in clickhouse_event_counts)
+        
+        BATCH_EXPORT_MONITORING_DURATION_HISTOGRAM.record(duration_seconds, {"batch_export_id": str(inputs.batch_export_id)})
+        
+        if duration_seconds > 0:
+            records_per_second = total_records / duration_seconds
+            BATCH_EXPORT_MONITORING_PERFORMANCE_GAUGE.set(records_per_second, {"batch_export_id": str(inputs.batch_export_id)})
+            
+            # Estimate throughput (assuming average 1KB per record)
+            estimated_bytes_per_second = records_per_second * 1024
+            BATCH_EXPORT_MONITORING_THROUGHPUT_GAUGE.set(estimated_bytes_per_second, {"batch_export_id": str(inputs.batch_export_id)})
+
+        logger.info(
+            "Batch exports monitoring completed: duration=%fs, records=%d, rps=%.2f", 
+            duration_seconds, total_records, records_per_second if duration_seconds > 0 else 0
+        )
+
+        return total_rows_updated
