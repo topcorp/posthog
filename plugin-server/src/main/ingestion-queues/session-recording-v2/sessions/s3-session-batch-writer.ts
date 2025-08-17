@@ -42,7 +42,17 @@ class S3SessionBatchFileWriter implements SessionBatchFileWriter {
         })
 
         this.stream.on('error', (error) => {
-            logger.error('🔄', 's3_session_batch_writer_stream_error', { key: this.key, error })
+            logger.error('🔄', 's3_session_batch_writer_stream_error', { 
+                key: this.key, 
+                bucket: this.bucket,
+                prefix: this.prefix,
+                timeout: this.timeout,
+                currentOffset: this.currentOffset,
+                error,
+                errorMessage: error instanceof Error ? error.message : String(error),
+                errorCode: (error as any)?.code,
+                errorName: error instanceof Error ? error.name : undefined
+            })
             SessionBatchMetrics.incrementS3UploadErrors()
             this.handleError(error)
         })
@@ -54,7 +64,18 @@ class S3SessionBatchFileWriter implements SessionBatchFileWriter {
         }, this.timeout)
 
         this.uploadPromise = upload.done().catch((error) => {
-            logger.error('🔄', 's3_session_batch_writer_upload_error', { key: this.key, error })
+            logger.error('🔄', 's3_session_batch_writer_upload_error', { 
+                key: this.key,
+                bucket: this.bucket,
+                prefix: this.prefix,
+                timeout: this.timeout,
+                currentOffset: this.currentOffset,
+                uploadDuration: (Date.now() - this.uploadStartTime) / 1000,
+                error,
+                errorMessage: error instanceof Error ? error.message : String(error),
+                errorCode: (error as any)?.code,
+                errorName: error instanceof Error ? error.name : undefined
+            })
             SessionBatchMetrics.incrementS3UploadErrors()
             this.handleError(error)
             throw error
@@ -95,7 +116,16 @@ class S3SessionBatchFileWriter implements SessionBatchFileWriter {
                 })
                 .catch((error) => {
                     // Defer to the common error handling code, it will call reject if necessary.
-                    logger.error('🔄', 's3_session_batch_writer_operation_error', { key: this.key, error })
+                    logger.error('🔄', 's3_session_batch_writer_operation_error', { 
+                        key: this.key,
+                        bucket: this.bucket,
+                        prefix: this.prefix,
+                        currentOffset: this.currentOffset,
+                        error,
+                        errorMessage: error instanceof Error ? error.message : String(error),
+                        errorCode: (error as any)?.code,
+                        errorName: error instanceof Error ? error.name : undefined
+                    })
                     SessionBatchMetrics.incrementS3UploadErrors()
                     this.handleError(error)
                 })
@@ -139,7 +169,17 @@ class S3SessionBatchFileWriter implements SessionBatchFileWriter {
                 SessionBatchMetrics.observeS3UploadLatency(uploadDuration)
                 SessionBatchMetrics.incrementS3BytesWritten(this.currentOffset)
             } catch (error) {
-                logger.error('🔄', 's3_session_batch_writer_upload_error', { key: this.key, error })
+                logger.error('🔄', 's3_session_batch_writer_finish_error', { 
+                    key: this.key,
+                    bucket: this.bucket,
+                    prefix: this.prefix,
+                    currentOffset: this.currentOffset,
+                    uploadDuration: (Date.now() - this.uploadStartTime) / 1000,
+                    error,
+                    errorMessage: error instanceof Error ? error.message : String(error),
+                    errorCode: (error as any)?.code,
+                    errorName: error instanceof Error ? error.name : undefined
+                })
                 SessionBatchMetrics.incrementS3UploadErrors()
                 throw error
             }
@@ -175,7 +215,12 @@ export class S3SessionBatchFileStorage implements SessionBatchFileStorage {
         } catch (error) {
             logger.error('🔁', 's3_session_batch_writer_healthcheck_error', {
                 bucket: this.bucket,
+                prefix: this.prefix,
+                timeout: this.timeout,
                 error,
+                errorMessage: error instanceof Error ? error.message : String(error),
+                errorCode: (error as any)?.code,
+                errorName: error instanceof Error ? error.name : undefined
             })
             return false
         }

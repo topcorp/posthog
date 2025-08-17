@@ -81,6 +81,10 @@ export interface BatchWritingPersonsStoreOptions {
     dbWriteMode: PersonBatchWritingDbWriteMode
     maxOptimisticUpdateRetries: number
     optimisticUpdateRetryInterval: number
+    // Performance optimization settings
+    enableAsyncFlush: boolean
+    batchFlushDelayMs: number
+    maxBatchSize: number
 }
 
 const DEFAULT_OPTIONS: BatchWritingPersonsStoreOptions = {
@@ -88,6 +92,10 @@ const DEFAULT_OPTIONS: BatchWritingPersonsStoreOptions = {
     maxConcurrentUpdates: 10,
     maxOptimisticUpdateRetries: 5,
     optimisticUpdateRetryInterval: 50,
+    // Performance optimization defaults
+    enableAsyncFlush: false, // Disabled by default for safety
+    batchFlushDelayMs: 100, // 100ms delay for batching
+    maxBatchSize: 100, // Max 100 updates per batch
 }
 
 interface CacheMetrics {
@@ -130,6 +138,9 @@ export class BatchWritingPersonsStoreForBatch implements PersonsStoreForBatch, B
     private updateLatencyPerDistinctIdSeconds: Map<string, Map<UpdateType, number>>
     private cacheMetrics: CacheMetrics
     private options: BatchWritingPersonsStoreOptions
+    // Performance optimization state
+    private flushTimer: NodeJS.Timeout | null = null
+    private pendingFlush: Promise<FlushResult[]> | null = null
 
     constructor(
         private personRepository: PersonRepository,
@@ -154,6 +165,21 @@ export class BatchWritingPersonsStoreForBatch implements PersonsStoreForBatch, B
     }
 
     async flush(): Promise<FlushResult[]> {
+        // If async flush is enabled and we have pending operations, wait for them
+        if (this.options.enableAsyncFlush && this.pendingFlush) {
+            return await this.pendingFlush
+        }
+
+        // Clear any pending timer since we're flushing now
+        if (this.flushTimer) {
+            clearTimeout(this.flushTimer)
+            this.flushTimer = null
+        }
+
+        return await this.performFlush()
+    }
+
+    private async performFlush(): Promise<FlushResult[]> {
         const flushStartTime = performance.now()
         const updateEntries = Array.from(this.personUpdateCache.entries()).filter(
             (entry): entry is [string, PersonUpdate] => {
@@ -358,6 +384,8 @@ export class BatchWritingPersonsStoreForBatch implements PersonsStoreForBatch, B
         // First check the main cache
         const cachedPerson = this.getCachedPersonForUpdateByDistinctId(teamId, distinctId)
         if (cachedPerson !== undefined) {
+            // Cache hit optimization - avoid conversion overhead when possible
+            this.cacheMetrics.checkCacheHits++
             return cachedPerson === null ? null : toInternalPerson(cachedPerson)
         }
 
@@ -436,7 +464,7 @@ export class BatchWritingPersonsStoreForBatch implements PersonsStoreForBatch, B
         _tx?: PersonRepositoryTransaction
     ): Promise<[InternalPerson, TopicMessage[], boolean]> {
         this.incrementCount('updatePersonForMerge', distinctId)
-        return Promise.resolve(this.addPersonUpdateToBatch(person, update, distinctId))
+        return Promise.resolve(this.addPersonUpdateToBatchOptimized(person, update, distinctId))
     }
 
     updatePersonWithPropertiesDiffForUpdate(
@@ -1153,5 +1181,76 @@ export class BatchWritingPersonsStoreForBatch implements PersonsStoreForBatch, B
         }
 
         return updatedPersonUpdate
+    }
+
+    /**
+     * Schedule a flush operation with batching optimization.
+     * This can help reduce database load during high traffic periods.
+     */
+    private scheduleFlush(): void {
+        if (!this.options.enableAsyncFlush) {
+            return
+        }
+
+        // If we already have a pending flush, don't schedule another
+        if (this.pendingFlush || this.flushTimer) {
+            return
+        }
+
+        const updateEntries = Array.from(this.personUpdateCache.entries()).filter(
+            ([_, update]) => update !== null && update.needs_write
+        )
+
+        // If we've reached the max batch size, flush immediately
+        if (updateEntries.length >= this.options.maxBatchSize) {
+            this.pendingFlush = this.performFlush().finally(() => {
+                this.pendingFlush = null
+            })
+            return
+        }
+
+        // Otherwise, schedule a delayed flush
+        this.flushTimer = setTimeout(() => {
+            this.flushTimer = null
+            this.pendingFlush = this.performFlush().finally(() => {
+                this.pendingFlush = null
+            })
+        }, this.options.batchFlushDelayMs)
+    }
+
+    /**
+     * Override the batch update methods to schedule optimized flushes
+     */
+    private addPersonUpdateToBatchOptimized(
+        person: InternalPerson,
+        update: Partial<InternalPerson>,
+        distinctId: string
+    ): [InternalPerson, TopicMessage[], boolean] {
+        const result = this.addPersonUpdateToBatch(person, update, distinctId)
+        
+        // Schedule an optimized flush if enabled
+        this.scheduleFlush()
+        
+        return result
+    }
+
+    /**
+     * Clean up resources and cancel pending operations
+     */
+    cleanup(): void {
+        if (this.flushTimer) {
+            clearTimeout(this.flushTimer)
+            this.flushTimer = null
+        }
+        
+        // Clear caches to free memory
+        this.personCheckCache.clear()
+        this.distinctIdToPersonId.clear()
+        this.personUpdateCache.clear()
+        this.fetchPromisesForUpdate.clear()
+        this.fetchPromisesForChecking.clear()
+        this.methodCountsPerDistinctId.clear()
+        this.databaseOperationCountsPerDistinctId.clear()
+        this.updateLatencyPerDistinctIdSeconds.clear()
     }
 }
