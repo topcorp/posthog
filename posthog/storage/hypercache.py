@@ -5,6 +5,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 import threading
 from django.core.cache import cache
+from django.conf import settings
 from posthoganalytics import capture_exception
 from prometheus_client import Counter
 import structlog
@@ -44,9 +45,18 @@ class HyperCacheStoreMissing:
 KeyType = Team | str | int
 
 
-# Shared thread pool to reduce resource usage from multiple ThreadPoolExecutor instances
+# Shared thread pool and batching infrastructure for S3 writes
 _S3_WRITE_EXECUTOR_LOCK = threading.Lock()
 _S3_WRITE_EXECUTOR = None
+_S3_WRITE_BATCH_LOCK = threading.Lock()
+_S3_WRITE_BATCH = []
+_S3_BATCH_TIMER = None
+
+# Configuration with fallback to sensible defaults
+_S3_BATCH_SIZE_LIMIT = getattr(settings, 'HYPERCACHE_S3_BATCH_SIZE', 10)  # Max items per batch
+_S3_BATCH_TIME_LIMIT = getattr(settings, 'HYPERCACHE_S3_BATCH_TIME_LIMIT', 2.0)  # Max seconds to wait
+_S3_BATCHING_ENABLED = getattr(settings, 'HYPERCACHE_S3_BATCHING_ENABLED', True)  # Enable/disable batching
+_S3_WRITE_POOL_SIZE = getattr(settings, 'HYPERCACHE_S3_WRITE_POOL_SIZE', 8)  # Thread pool size
 
 
 def _get_s3_write_executor():
@@ -56,10 +66,75 @@ def _get_s3_write_executor():
         with _S3_WRITE_EXECUTOR_LOCK:
             if _S3_WRITE_EXECUTOR is None:
                 _S3_WRITE_EXECUTOR = ThreadPoolExecutor(
-                    max_workers=4,  # Reasonable limit for S3 writes
+                    max_workers=_S3_WRITE_POOL_SIZE,
                     thread_name_prefix="hypercache-s3-shared"
                 )
     return _S3_WRITE_EXECUTOR
+
+
+def shutdown_s3_write_infrastructure():
+    """Gracefully shutdown S3 write infrastructure - flush pending writes and close threads."""
+    global _S3_WRITE_EXECUTOR, _S3_BATCH_TIMER
+    
+    # Flush any pending batch
+    _flush_s3_batch()
+    
+    # Shutdown thread pool
+    if _S3_WRITE_EXECUTOR:
+        with _S3_WRITE_EXECUTOR_LOCK:
+            if _S3_WRITE_EXECUTOR:
+                _S3_WRITE_EXECUTOR.shutdown(wait=True, timeout=10)
+                _S3_WRITE_EXECUTOR = None
+    
+    # Cancel timer if running
+    if _S3_BATCH_TIMER:
+        with _S3_WRITE_BATCH_LOCK:
+            if _S3_BATCH_TIMER:
+                _S3_BATCH_TIMER.cancel()
+                _S3_BATCH_TIMER = None
+
+
+def _flush_s3_batch():
+    """Flush pending S3 writes in batch."""
+    global _S3_WRITE_BATCH, _S3_BATCH_TIMER
+    
+    with _S3_WRITE_BATCH_LOCK:
+        if not _S3_WRITE_BATCH:
+            return
+        
+        batch_to_process = _S3_WRITE_BATCH[:]
+        _S3_WRITE_BATCH.clear()
+        if _S3_BATCH_TIMER:
+            _S3_BATCH_TIMER.cancel()
+            _S3_BATCH_TIMER = None
+    
+    def _process_s3_batch():
+        """Process a batch of S3 writes concurrently."""
+        start_time = time.time()
+        successful_writes = 0
+        failed_writes = 0
+        
+        for write_task in batch_to_process:
+            try:
+                write_task()
+                successful_writes += 1
+            except Exception as e:
+                failed_writes += 1
+                # Error logging is handled within each write task
+                
+        batch_duration = (time.time() - start_time) * 1000
+        logger.debug(
+            "hypercache_s3_batch_flush_completed",
+            batch_size=len(batch_to_process),
+            successful_writes=successful_writes,
+            failed_writes=failed_writes,
+            batch_duration_ms=batch_duration,
+            avg_write_time_ms=batch_duration / len(batch_to_process) if batch_to_process else 0
+        )
+    
+    # Execute batch processing in thread pool
+    executor = _get_s3_write_executor()
+    executor.submit(_process_s3_batch)
 
 
 class HyperCache:
@@ -196,14 +271,16 @@ class HyperCache:
             object_storage.write(key, json.dumps(data))
     
     def _set_cache_value_s3_async(self, key: KeyType, data: dict | None | HyperCacheStoreMissing) -> None:
-        """Asynchronously write to S3 to avoid blocking Redis writes"""
+        """Asynchronously write to S3 using batching to avoid blocking Redis writes and improve performance"""
+        global _S3_WRITE_BATCH, _S3_BATCH_TIMER
+        
         def _s3_write_task():
             start_time = time.time()
             try:
                 self._set_cache_value_s3(key, data)
                 write_duration = (time.time() - start_time) * 1000  # Convert to milliseconds
                 logger.debug(
-                    "hypercache_s3_async_write_success",
+                    "hypercache_s3_batch_write_success",
                     namespace=self.namespace,
                     value=self.value,
                     cache_key=self.get_cache_key(key),
@@ -213,7 +290,7 @@ class HyperCache:
                 # More specific handling for S3 errors
                 write_duration = (time.time() - start_time) * 1000
                 logger.error(
-                    "hypercache_s3_async_write_storage_error",
+                    "hypercache_s3_batch_write_storage_error",
                     namespace=self.namespace,
                     value=self.value,
                     cache_key=self.get_cache_key(key),
@@ -229,17 +306,18 @@ class HyperCache:
                     "namespace": self.namespace,
                     "value": self.value,
                     "cache_key": self.get_cache_key(key),
-                    "operation": "hypercache_s3_async_write",
+                    "operation": "hypercache_s3_batch_write",
                     "write_duration_ms": write_duration,
                     "aws_error_code": getattr(e, 'response', {}).get('Error', {}).get('Code', 'unknown') if hasattr(e, 'response') else 'unknown',
                     "http_status_code": getattr(e, 'response', {}).get('ResponseMetadata', {}).get('HTTPStatusCode', 0) if hasattr(e, 'response') else 0,
                     "request_id": getattr(e, 'response', {}).get('ResponseMetadata', {}).get('RequestId', 'unknown') if hasattr(e, 'response') else 'unknown'
                 })
+                raise
             except Exception as e:
                 # General exception handling
                 write_duration = (time.time() - start_time) * 1000
                 logger.error(
-                    "hypercache_s3_async_write_failed",
+                    "hypercache_s3_batch_write_failed",
                     namespace=self.namespace,
                     value=self.value,
                     cache_key=self.get_cache_key(key),
@@ -247,47 +325,50 @@ class HyperCache:
                     error=str(e),
                     write_duration_ms=write_duration,
                     data_present=data is not None and not isinstance(data, HyperCacheStoreMissing),
-                    stack_trace=str(e.__traceback__) if hasattr(e, '__traceback__') else None
                 )
                 capture_exception(e, extra_data={
                     "namespace": self.namespace,
                     "value": self.value,
                     "cache_key": self.get_cache_key(key),
-                    "operation": "hypercache_s3_async_write",
+                    "operation": "hypercache_s3_batch_write",
                     "write_duration_ms": write_duration
                 })
+                raise
         
-        # Use shared thread pool instead of creating new ones to reduce resource usage
-        executor = _get_s3_write_executor()
-        try:
-            future = executor.submit(_s3_write_task)
-            # Add callback for error logging if the future fails
-            def _handle_future_result(f):
-                try:
-                    f.result(timeout=0.1)  # Short timeout to avoid blocking
-                except Exception as e:
-                    logger.warning(
-                        "hypercache_s3_async_future_exception",
-                        namespace=self.namespace,
-                        value=self.value,
-                        cache_key=self.get_cache_key(key),
-                        error_type=type(e).__name__,
-                        error=str(e)
-                    )
-            future.add_done_callback(_handle_future_result)
-        except Exception as e:
-            logger.error(
-                "hypercache_s3_async_submit_failed",
-                namespace=self.namespace,
-                value=self.value,
-                cache_key=self.get_cache_key(key),
-                error_type=type(e).__name__,
-                error=str(e),
-                executor_state="shared_pool"
-            )
-            capture_exception(e, extra_data={
-                "namespace": self.namespace,
-                "value": self.value,
-                "cache_key": self.get_cache_key(key),
-                "operation": "hypercache_s3_async_submit"
-            })
+        # Use batching if enabled, otherwise use direct execution
+        if _S3_BATCHING_ENABLED:
+            # Add write task to batch for improved performance during high load
+            should_flush = False
+            with _S3_WRITE_BATCH_LOCK:
+                _S3_WRITE_BATCH.append(_s3_write_task)
+                
+                # Check if we should flush the batch immediately
+                if len(_S3_WRITE_BATCH) >= _S3_BATCH_SIZE_LIMIT:
+                    should_flush = True
+                elif len(_S3_WRITE_BATCH) == 1:
+                    # First item in batch - start timer
+                    _S3_BATCH_TIMER = threading.Timer(_S3_BATCH_TIME_LIMIT, _flush_s3_batch)
+                    _S3_BATCH_TIMER.start()
+            
+            if should_flush:
+                _flush_s3_batch()
+        else:
+            # Execute directly without batching (fallback mode)
+            executor = _get_s3_write_executor()
+            try:
+                executor.submit(_s3_write_task)
+            except Exception as e:
+                logger.error(
+                    "hypercache_s3_direct_submit_failed",
+                    namespace=self.namespace,
+                    value=self.value,
+                    cache_key=self.get_cache_key(key),
+                    error_type=type(e).__name__,
+                    error=str(e)
+                )
+                capture_exception(e, extra_data={
+                    "namespace": self.namespace,
+                    "value": self.value,
+                    "cache_key": self.get_cache_key(key),
+                    "operation": "hypercache_s3_direct_submit"
+                })
