@@ -25,6 +25,13 @@ SAML_MOCK_SETTINGS = {
     "SOCIAL_AUTH_SAML_SECURITY_CONFIG": {
         "wantAttributeStatement": False,  # already present in settings
         "allowSingleLabelDomains": True,  # to allow `http://testserver` in tests
+        "requestedAuthnContext": [
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport",
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:MultifactorUnregistered"
+        ],  # Use secure authentication contexts in tests
+        "requestedAuthnContextComparison": "minimum",  # Accept specified method or stronger
+        "wantAssertionsSigned": True,  # Require signed assertions for security
+        "wantNameIdEncrypted": False,  # NameID encryption is optional
     },
     "SITE_URL": "http://localhost:8000",  # http://localhost:8010 is now the default, but fixtures use 8000
 }

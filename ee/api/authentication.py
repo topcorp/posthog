@@ -1,4 +1,5 @@
 from typing import Any, Union
+import logging
 
 import posthoganalytics
 from django.core.exceptions import ValidationError as DjangoValidationError
@@ -23,6 +24,8 @@ from posthog.constants import AvailableFeature
 from posthog.models.organization import OrganizationMembership
 from posthog.models.organization_domain import OrganizationDomain
 from social_django.models import UserSocialAuth
+
+logger = logging.getLogger(__name__)
 
 
 @api_view(["GET"])
@@ -49,10 +52,19 @@ class MultitenantSAMLAuth(SAMLAuth):
 
     def auth_complete(self, *args, **kwargs):
         try:
-            return super().auth_complete(*args, **kwargs)
-        except Exception:
+            result = super().auth_complete(*args, **kwargs)
+            logger.info("SAML authentication completed successfully with enhanced security context")
+            return result
+        except Exception as e:
             import json
 
+            logger.warning(
+                "SAML authentication failed",
+                extra={
+                    "error": str(e),
+                    "error_type": type(e).__name__
+                }
+            )
             posthoganalytics.tag("request_data", json.dumps(self.strategy.request_data()))
             raise
 
