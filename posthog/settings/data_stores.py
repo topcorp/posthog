@@ -196,6 +196,22 @@ QUERYSERVICE_VERIFY: bool = get_from_env("QUERYSERVICE_VERIFY", CLICKHOUSE_VERIF
 CLICKHOUSE_CONN_POOL_MIN: int = get_from_env("CLICKHOUSE_CONN_POOL_MIN", 20, type_cast=int)
 CLICKHOUSE_CONN_POOL_MAX: int = get_from_env("CLICKHOUSE_CONN_POOL_MAX", 1000, type_cast=int)
 
+# Validate connection pool configuration
+if CLICKHOUSE_CONN_POOL_MIN < 1:
+    raise ImproperlyConfigured("CLICKHOUSE_CONN_POOL_MIN must be at least 1")
+if CLICKHOUSE_CONN_POOL_MAX < 1:
+    raise ImproperlyConfigured("CLICKHOUSE_CONN_POOL_MAX must be at least 1")
+if CLICKHOUSE_CONN_POOL_MIN > CLICKHOUSE_CONN_POOL_MAX:
+    raise ImproperlyConfigured(
+        f"CLICKHOUSE_CONN_POOL_MIN ({CLICKHOUSE_CONN_POOL_MIN}) cannot be greater than "
+        f"CLICKHOUSE_CONN_POOL_MAX ({CLICKHOUSE_CONN_POOL_MAX})"
+    )
+if CLICKHOUSE_CONN_POOL_MAX > 10000:
+    raise ImproperlyConfigured(
+        f"CLICKHOUSE_CONN_POOL_MAX ({CLICKHOUSE_CONN_POOL_MAX}) should not exceed 10000 "
+        "to prevent excessive resource usage"
+    )
+
 CLICKHOUSE_STABLE_HOST: str = get_from_env("CLICKHOUSE_STABLE_HOST", CLICKHOUSE_HOST)
 # If enabled, some queries will use system.cluster table to query each shard
 CLICKHOUSE_ALLOW_PER_SHARD_EXECUTION: bool = get_from_env(
