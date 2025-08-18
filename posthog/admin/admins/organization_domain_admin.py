@@ -11,10 +11,12 @@ class OrganizationDomainAdmin(admin.ModelAdmin):
         "jit_provisioning_enabled",
         "sso_enforcement",
         "saml_status",
+        "saml_auth_context_mode",
     )
     list_filter = (
         "jit_provisioning_enabled",
         "sso_enforcement",
+        "saml_auth_context_mode",
         "verified_at",
     )
     search_fields = ("domain", "organization__name")
@@ -28,7 +30,7 @@ class OrganizationDomainAdmin(admin.ModelAdmin):
         (None, {"fields": ("id", "organization", "domain")}),
         ("Verification", {"fields": ("verification_challenge", "verified_at", "last_verification_retry")}),
         ("Access Control", {"fields": ("jit_provisioning_enabled", "sso_enforcement")}),
-        ("SAML Configuration", {"fields": ("saml_entity_id", "saml_acs_url", "saml_x509_cert")}),
+        ("SAML Configuration", {"fields": ("saml_entity_id", "saml_acs_url", "saml_x509_cert", "saml_auth_context_mode")}),
     )
     list_display_links = ("domain",)
     ordering = ("domain",)

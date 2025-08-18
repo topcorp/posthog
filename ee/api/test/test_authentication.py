@@ -870,3 +870,130 @@ class TestCustomGoogleOAuth2(APILicensedTest):
             self.google_oauth.get_user_id(self.details, response)
 
         self.assertEqual(str(e.exception), "Google OAuth response missing 'sub' claim")
+
+
+class TestSAMLAuthenticationContextValidation(APILicensedTest):
+    """Test SAML authentication context validation security enhancements."""
+
+    def setUp(self):
+        super().setUp()
+        from ee.api.authentication import MultitenantSAMLAuth
+        from posthog.models.organization_domain import OrganizationDomain
+        
+        # Create organization domain with SAML configuration
+        self.domain = OrganizationDomain.objects.create(
+            organization=self.organization,
+            domain="testdomain.com",
+            verified_at=timezone.now(),
+            saml_entity_id="test-entity-id",
+            saml_acs_url="https://test-idp.com/sso/saml",
+            saml_x509_cert="test-certificate",
+        )
+        
+        self.saml_auth = MultitenantSAMLAuth()
+
+    def test_is_strong_auth_context_strict_mode_allows_strong_contexts(self):
+        """Test that strict mode only allows strong authentication contexts."""
+        self.domain.saml_auth_context_mode = "strict"
+        self.domain.save()
+
+        strong_contexts = [
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport",
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:MultifactorUnregistered",
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:Smartcard",
+        ]
+        
+        for context in strong_contexts:
+            result = self.saml_auth._is_strong_auth_context(context, self.domain)
+            self.assertTrue(result, f"Strong context {context} should be accepted in strict mode")
+
+    def test_is_strong_auth_context_strict_mode_rejects_weak_contexts(self):
+        """Test that strict mode rejects weak authentication contexts."""
+        self.domain.saml_auth_context_mode = "strict"
+        self.domain.save()
+
+        weak_contexts = [
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:Password",
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:unspecified",
+            "",
+        ]
+        
+        for context in weak_contexts:
+            result = self.saml_auth._is_strong_auth_context(context, self.domain)
+            self.assertFalse(result, f"Weak context {context} should be rejected in strict mode")
+
+    def test_is_strong_auth_context_balanced_mode_allows_conditionally_acceptable(self):
+        """Test that balanced mode allows conditionally acceptable contexts."""
+        self.domain.saml_auth_context_mode = "balanced"
+        self.domain.save()
+
+        conditionally_acceptable_contexts = [
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:Password",
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:TimeSyncToken",
+        ]
+        
+        for context in conditionally_acceptable_contexts:
+            result = self.saml_auth._is_strong_auth_context(context, self.domain)
+            self.assertTrue(result, f"Conditionally acceptable context {context} should be accepted in balanced mode")
+
+    def test_is_strong_auth_context_permissive_mode_allows_unknown_contexts(self):
+        """Test that permissive mode allows unknown authentication contexts."""
+        self.domain.saml_auth_context_mode = "permissive"
+        self.domain.save()
+
+        unknown_contexts = [
+            "urn:custom:unknown:authentication:context",
+            "some-proprietary-context",
+        ]
+        
+        for context in unknown_contexts:
+            result = self.saml_auth._is_strong_auth_context(context, self.domain)
+            self.assertTrue(result, f"Unknown context {context} should be accepted in permissive mode")
+
+    def test_is_strong_auth_context_always_rejects_insecure_contexts(self):
+        """Test that all modes reject explicitly insecure contexts."""
+        insecure_contexts = [
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:InternetProtocol",
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:InternetProtocolPassword",
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:PreviousSession",
+        ]
+        
+        modes = ["strict", "balanced", "permissive"]
+        
+        for mode in modes:
+            self.domain.saml_auth_context_mode = mode
+            self.domain.save()
+            
+            for context in insecure_contexts:
+                result = self.saml_auth._is_strong_auth_context(context, self.domain)
+                self.assertFalse(result, f"Insecure context {context} should be rejected in {mode} mode")
+
+    def test_is_strong_auth_context_default_mode_is_balanced(self):
+        """Test that default mode (no domain config) behaves as balanced."""
+        # Test without domain config
+        result = self.saml_auth._is_strong_auth_context(
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:Password", 
+            None
+        )
+        self.assertTrue(result, "Default mode should behave as balanced")
+
+        # Test with domain but no auth_context_mode set
+        self.domain.saml_auth_context_mode = None
+        self.domain.save()
+        
+        result = self.saml_auth._is_strong_auth_context(
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:Password", 
+            self.domain
+        )
+        self.assertTrue(result, "Domain without auth_context_mode should default to balanced")
+
+    def test_is_strong_auth_context_unknown_contexts_rejected_in_strict_balanced(self):
+        """Test that unknown contexts are rejected in strict and balanced modes."""
+        unknown_context = "urn:custom:unknown:authentication:context"
+        
+        for mode in ["strict", "balanced"]:
+            self.domain.saml_auth_context_mode = mode
+            self.domain.save()
+            
+            result = self.saml_auth._is_strong_auth_context(unknown_context, self.domain)
+            self.assertFalse(result, f"Unknown context should be rejected in {mode} mode")

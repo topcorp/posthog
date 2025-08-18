@@ -137,6 +137,18 @@ class OrganizationDomain(UUIDModel):
     saml_entity_id = models.CharField(max_length=512, blank=True, null=True)
     saml_acs_url = models.CharField(max_length=512, blank=True, null=True)
     saml_x509_cert = models.TextField(blank=True, null=True)
+    saml_auth_context_mode = models.CharField(
+        max_length=16, 
+        blank=True, 
+        null=True,
+        default="balanced",
+        choices=[
+            ("strict", "Strict - Only allow strong authentication contexts"),
+            ("balanced", "Balanced - Allow strong and conditionally acceptable contexts"),
+            ("permissive", "Permissive - Accept most authentication contexts (legacy behavior)")
+        ],
+        help_text="Controls how strictly SAML authentication contexts are validated. Strict mode enhances security but may cause compatibility issues with some IdPs."
+    )
 
     class Meta:
         verbose_name = "domain"

@@ -54,20 +54,37 @@ class MultitenantSAMLAuth(SAMLAuth):
         try:
             result = super().auth_complete(*args, **kwargs)
             
-            # Enhanced security validation: ensure strong authentication context was used
+            # Enhanced security validation: ensure authentication context meets domain requirements
             if hasattr(result, 'response') and 'AuthnContextClassRef' in str(result.response):
                 auth_context = self._extract_auth_context(result.response)
-                if auth_context and not self._is_strong_auth_context(auth_context):
+                
+                # Get domain configuration for authentication context validation
+                relay_state = self.strategy.request.POST.get('RelayState') or self.strategy.request.GET.get('RelayState')
+                domain_config = None
+                if relay_state:
+                    try:
+                        from posthog.models.organization_domain import OrganizationDomain
+                        domain_config = OrganizationDomain.objects.get(id=relay_state)
+                    except (OrganizationDomain.DoesNotExist, ValueError):
+                        logger.warning(
+                            "SAML authentication: Could not find domain config for RelayState",
+                            extra={"relay_state": relay_state}
+                        )
+                
+                if auth_context and not self._is_strong_auth_context(auth_context, domain_config):
+                    auth_mode = domain_config.saml_auth_context_mode if domain_config else "balanced"
                     logger.error(
-                        "SAML authentication rejected: Weak authentication context used",
+                        "SAML authentication rejected: Authentication context validation failed",
                         extra={
                             "auth_context": auth_context,
-                            "user_email": getattr(result, 'email', 'unknown')
+                            "auth_mode": auth_mode,
+                            "user_email": getattr(result, 'email', 'unknown'),
+                            "domain_id": domain_config.id if domain_config else None
                         }
                     )
                     raise AuthFailed("saml", "Authentication method not strong enough for this organization.")
             
-            logger.info("SAML authentication completed successfully with enhanced security context")
+            logger.info("SAML authentication completed successfully with enhanced security validation")
             return result
         except Exception as e:
             import json
@@ -259,41 +276,142 @@ class MultitenantSAMLAuth(SAMLAuth):
             )
         return ""
 
-    def _is_strong_auth_context(self, auth_context: str) -> bool:
+    def _is_strong_auth_context(self, auth_context: str, domain_config=None) -> bool:
         """
         Validate that the authentication context meets minimum security requirements.
-        Accept contexts that provide reasonable security while maintaining IdP compatibility.
+        This implementation enforces strong authentication contexts while maintaining
+        reasonable compatibility with enterprise IdPs based on domain configuration.
+        
+        Args:
+            auth_context: The SAML authentication context class reference
+            domain_config: OrganizationDomain instance with SAML configuration
         """
-        acceptable_contexts = [
-            "urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport",
-            "urn:oasis:names:tc:SAML:2.0:ac:classes:Password",  # Basic password auth is acceptable for most IdPs
-            "urn:oasis:names:tc:SAML:2.0:ac:classes:MultifactorUnregistered",
-            "urn:oasis:names:tc:SAML:2.0:ac:classes:Smartcard",
-            "urn:oasis:names:tc:SAML:2.0:ac:classes:SmartcardPKI",
-            "urn:oasis:names:tc:SAML:2.0:ac:classes:unspecified"  # Accept unspecified for broader IdP compatibility
+        # Strong authentication contexts that are explicitly allowed
+        strong_contexts = [
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport",  # Password over secure transport
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:MultifactorUnregistered",  # MFA without device registration
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:MultifactorContract",  # MFA with contract-based device registration
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:Smartcard",  # Smart card authentication
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:SmartcardPKI",  # Smart card with PKI
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:X509",  # X.509 certificate based
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:TLSClient",  # TLS client certificate
         ]
         
-        # Only explicitly reject clearly insecure authentication contexts
-        explicitly_rejected_contexts = [
+        # Conditionally acceptable contexts (require additional validation)
+        conditionally_acceptable_contexts = [
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:Password",  # Basic password auth
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:TimeSyncToken",  # Time-based tokens
+        ]
+        
+        # Explicitly rejected insecure contexts (always rejected regardless of mode)
+        rejected_contexts = [
             "urn:oasis:names:tc:SAML:2.0:ac:classes:InternetProtocol",  # No authentication required
-            "urn:oasis:names:tc:SAML:2.0:ac:classes:InternetProtocolPassword"  # Deprecated weak method
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:InternetProtocolPassword",  # Deprecated weak method
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:PreviousSession",  # Based on previous session only
         ]
         
-        if auth_context in explicitly_rejected_contexts:
-            logger.warning(
-                "Insecure authentication context rejected",
-                extra={"auth_context": auth_context}
+        # Get authentication context validation mode
+        auth_mode = domain_config.saml_auth_context_mode if domain_config else "balanced"
+        if not auth_mode:
+            auth_mode = "balanced"  # Default to balanced mode
+        
+        # Always reject explicitly insecure contexts
+        if auth_context in rejected_contexts:
+            logger.error(
+                "SAML authentication rejected: Insecure authentication context",
+                extra={
+                    "auth_context": auth_context,
+                    "auth_mode": auth_mode,
+                    "domain_id": domain_config.id if domain_config else None
+                }
             )
             return False
-            
-        # Log unknown contexts for monitoring but don't reject for compatibility
-        if auth_context not in acceptable_contexts and auth_context:
+        
+        # Always accept strong authentication contexts
+        if auth_context in strong_contexts:
             logger.info(
-                "Unknown authentication context accepted for compatibility",
-                extra={"auth_context": auth_context}
+                "SAML authentication accepted: Strong authentication context",
+                extra={
+                    "auth_context": auth_context,
+                    "auth_mode": auth_mode,
+                    "domain_id": domain_config.id if domain_config else None
+                }
             )
-            
-        return True  # Accept by default to prevent authentication failures with various IdPs
+            return True
+        
+        # Handle conditionally acceptable contexts based on mode
+        if auth_context in conditionally_acceptable_contexts:
+            if auth_mode == "strict":
+                logger.error(
+                    "SAML authentication rejected: Weak authentication context not allowed in strict mode",
+                    extra={
+                        "auth_context": auth_context,
+                        "auth_mode": auth_mode,
+                        "domain_id": domain_config.id if domain_config else None,
+                        "recommendation": "Enable MFA or use stronger authentication method, or change to balanced/permissive mode"
+                    }
+                )
+                return False
+            else:
+                logger.warning(
+                    "SAML authentication accepted with warning: Weak authentication context",
+                    extra={
+                        "auth_context": auth_context,
+                        "auth_mode": auth_mode,
+                        "domain_id": domain_config.id if domain_config else None,
+                        "recommendation": "Consider upgrading to MFA or stronger authentication method"
+                    }
+                )
+                return True
+        
+        # Handle unspecified contexts based on mode
+        if auth_context == "urn:oasis:names:tc:SAML:2.0:ac:classes:unspecified" or not auth_context:
+            if auth_mode == "strict":
+                logger.error(
+                    "SAML authentication rejected: Unspecified authentication context not allowed in strict mode",
+                    extra={
+                        "auth_context": auth_context or "empty",
+                        "auth_mode": auth_mode,
+                        "domain_id": domain_config.id if domain_config else None,
+                        "recommendation": "Configure IdP to specify explicit authentication context"
+                    }
+                )
+                return False
+            else:
+                logger.warning(
+                    "SAML authentication accepted: Unspecified authentication context",
+                    extra={
+                        "auth_context": auth_context or "empty",
+                        "auth_mode": auth_mode,
+                        "domain_id": domain_config.id if domain_config else None,
+                        "recommendation": "IdP should specify explicit authentication context for better security"
+                    }
+                )
+                return True
+        
+        # Handle unknown contexts based on mode
+        if auth_mode == "permissive":
+            logger.warning(
+                "SAML authentication accepted: Unknown authentication context (permissive mode)",
+                extra={
+                    "auth_context": auth_context,
+                    "auth_mode": auth_mode,
+                    "domain_id": domain_config.id if domain_config else None,
+                    "recommendation": "Verify authentication context is secure and consider using balanced or strict mode"
+                }
+            )
+            return True
+        else:
+            logger.error(
+                "SAML authentication rejected: Unknown authentication context",
+                extra={
+                    "auth_context": auth_context,
+                    "auth_mode": auth_mode,
+                    "domain_id": domain_config.id if domain_config else None,
+                    "recommendation": "Update SAML configuration to use supported authentication contexts or enable permissive mode"
+                }
+            )
+            return False
 
 
 class CustomGoogleOAuth2(GoogleOAuth2):
