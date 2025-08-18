@@ -19,7 +19,15 @@ AUTHENTICATION_BACKENDS = [
 SOCIAL_AUTH_SAML_SP_ENTITY_ID = SITE_URL
 SOCIAL_AUTH_SAML_SECURITY_CONFIG = {
     "wantAttributeStatement": False,  # AttributeStatement is optional in the specification
-    "requestedAuthnContext": False,  # do not explicitly request a password login, also allow multifactor and others
+    "requestedAuthnContext": [
+        "urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport",
+        "urn:oasis:names:tc:SAML:2.0:ac:classes:MultifactorUnregistered",
+        "urn:oasis:names:tc:SAML:2.0:ac:classes:Smartcard",
+        "urn:oasis:names:tc:SAML:2.0:ac:classes:SmartcardPKI"
+    ],  # Request specific authentication contexts for stronger security
+    "requestedAuthnContextComparison": "minimum",  # Accept the requested context or stronger methods
+    "wantAssertionsSigned": True,  # Require signed assertions for better security
+    "wantNameIdEncrypted": False,  # NameID encryption is optional but can be enabled if needed
 }
 # Attributes below are required for the SAML integration from social_core to work properly
 SOCIAL_AUTH_SAML_SP_PUBLIC_CERT = ""
