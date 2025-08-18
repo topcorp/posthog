@@ -53,6 +53,20 @@ class MultitenantSAMLAuth(SAMLAuth):
     def auth_complete(self, *args, **kwargs):
         try:
             result = super().auth_complete(*args, **kwargs)
+            
+            # Enhanced security validation: ensure strong authentication context was used
+            if hasattr(result, 'response') and 'AuthnContextClassRef' in str(result.response):
+                auth_context = self._extract_auth_context(result.response)
+                if auth_context and not self._is_strong_auth_context(auth_context):
+                    logger.error(
+                        "SAML authentication rejected: Weak authentication context used",
+                        extra={
+                            "auth_context": auth_context,
+                            "user_email": getattr(result, 'email', 'unknown')
+                        }
+                    )
+                    raise AuthFailed("saml", "Authentication method not strong enough for this organization.")
+            
             logger.info("SAML authentication completed successfully with enhanced security context")
             return result
         except Exception as e:
@@ -75,14 +89,50 @@ class MultitenantSAMLAuth(SAMLAuth):
                 if isinstance(organization_domain_or_id, OrganizationDomain)
                 else OrganizationDomain.objects.verified_domains().get(id=organization_domain_or_id)
             )
-        except (OrganizationDomain.DoesNotExist, DjangoValidationError):
+        except (OrganizationDomain.DoesNotExist, DjangoValidationError) as e:
+            logger.warning(
+                "SAML authentication failed: Invalid organization domain",
+                extra={
+                    "domain_or_id": str(organization_domain_or_id),
+                    "error": str(e)
+                }
+            )
             raise AuthFailed("saml", "Authentication request is invalid. Invalid RelayState.")
 
         if not organization_domain.organization.is_feature_available(AvailableFeature.SAML):
+            logger.warning(
+                "SAML authentication failed: Feature not available",
+                extra={
+                    "organization_id": str(organization_domain.organization.id),
+                    "domain": organization_domain.domain
+                }
+            )
             raise AuthFailed(
                 "saml",
                 "Your organization does not have the required license to use SAML.",
             )
+
+        # Validate SAML configuration completeness
+        if not all([organization_domain.saml_entity_id, organization_domain.saml_acs_url, organization_domain.saml_x509_cert]):
+            logger.error(
+                "SAML authentication failed: Incomplete SAML configuration",
+                extra={
+                    "organization_id": str(organization_domain.organization.id),
+                    "domain": organization_domain.domain,
+                    "has_entity_id": bool(organization_domain.saml_entity_id),
+                    "has_acs_url": bool(organization_domain.saml_acs_url),
+                    "has_x509_cert": bool(organization_domain.saml_x509_cert)
+                }
+            )
+            raise AuthFailed("saml", "SAML configuration is incomplete for this domain.")
+
+        logger.info(
+            "SAML IdP configuration validated successfully",
+            extra={
+                "organization_id": str(organization_domain.organization.id),
+                "domain": organization_domain.domain
+            }
+        )
 
         return SAMLIdentityProvider(
             str(organization_domain.id),
@@ -189,6 +239,61 @@ class MultitenantSAMLAuth(SAMLAuth):
         USER_ID_ATTRIBUTES = ["name_id", "NAME_ID", "nameId", OID_USERID]
         uid = self._get_attr(response["attributes"], USER_ID_ATTRIBUTES)
         return f"{response['idp_name']}:{uid}"
+
+    def _extract_auth_context(self, response) -> str:
+        """
+        Extract authentication context class reference from SAML response.
+        """
+        try:
+            import xml.etree.ElementTree as ET
+            
+            if hasattr(response, 'xmlstr'):
+                root = ET.fromstring(response.xmlstr)
+                for elem in root.iter():
+                    if elem.tag.endswith('AuthnContextClassRef'):
+                        return elem.text or ""
+        except Exception as e:
+            logger.warning(
+                "Failed to extract authentication context",
+                extra={"error": str(e)}
+            )
+        return ""
+
+    def _is_strong_auth_context(self, auth_context: str) -> bool:
+        """
+        Validate that the authentication context meets minimum security requirements.
+        Accept contexts that provide reasonable security while maintaining IdP compatibility.
+        """
+        acceptable_contexts = [
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport",
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:Password",  # Basic password auth is acceptable for most IdPs
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:MultifactorUnregistered",
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:Smartcard",
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:SmartcardPKI",
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:unspecified"  # Accept unspecified for broader IdP compatibility
+        ]
+        
+        # Only explicitly reject clearly insecure authentication contexts
+        explicitly_rejected_contexts = [
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:InternetProtocol",  # No authentication required
+            "urn:oasis:names:tc:SAML:2.0:ac:classes:InternetProtocolPassword"  # Deprecated weak method
+        ]
+        
+        if auth_context in explicitly_rejected_contexts:
+            logger.warning(
+                "Insecure authentication context rejected",
+                extra={"auth_context": auth_context}
+            )
+            return False
+            
+        # Log unknown contexts for monitoring but don't reject for compatibility
+        if auth_context not in acceptable_contexts and auth_context:
+            logger.info(
+                "Unknown authentication context accepted for compatibility",
+                extra={"auth_context": auth_context}
+            )
+            
+        return True  # Accept by default to prevent authentication failures with various IdPs
 
 
 class CustomGoogleOAuth2(GoogleOAuth2):

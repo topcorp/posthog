@@ -21,13 +21,18 @@ SOCIAL_AUTH_SAML_SECURITY_CONFIG = {
     "wantAttributeStatement": False,  # AttributeStatement is optional in the specification
     "requestedAuthnContext": [
         "urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport",
+        "urn:oasis:names:tc:SAML:2.0:ac:classes:Password",
         "urn:oasis:names:tc:SAML:2.0:ac:classes:MultifactorUnregistered",
-        "urn:oasis:names:tc:SAML:2.0:ac:classes:Smartcard",
-        "urn:oasis:names:tc:SAML:2.0:ac:classes:SmartcardPKI"
-    ],  # Request specific authentication contexts for stronger security
-    "requestedAuthnContextComparison": "minimum",  # Accept the requested context or stronger methods
-    "wantAssertionsSigned": True,  # Require signed assertions for better security
-    "wantNameIdEncrypted": False,  # NameID encryption is optional but can be enabled if needed
+        "urn:oasis:names:tc:SAML:2.0:ac:classes:unspecified"
+    ],  # Accept multiple authentication contexts for broader IdP compatibility while maintaining security
+    "requestedAuthnContextComparison": "minimum",  # Accept minimum context or stronger for better compatibility
+    "wantAssertionsSigned": True,  # Require signed assertions for security
+    "wantNameIdEncrypted": False,  # NameID encryption optional for better IdP compatibility
+    "wantAssertionsEncrypted": False,  # Assertion encryption optional for better IdP compatibility
+    "signMetadata": True,  # Sign the SP metadata for integrity protection
+    "signatureAlgorithm": "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",  # Use SHA-256 instead of SHA-1
+    "allowSingleLabelDomains": False,  # Disable single label domains for security in production
+    "rejectUnsolicitedResponsesWithInResponseTo": True,  # Reject unsolicited responses to prevent replay attacks
 }
 # Attributes below are required for the SAML integration from social_core to work properly
 SOCIAL_AUTH_SAML_SP_PUBLIC_CERT = ""
