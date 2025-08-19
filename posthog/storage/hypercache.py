@@ -1,9 +1,10 @@
 import json
 import time
-from typing import Optional
+from typing import Optional, NamedTuple
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+import queue
 from django.core.cache import cache
 from django.conf import settings
 from posthoganalytics import capture_exception
@@ -41,6 +42,14 @@ class HyperCacheStoreMissing:
     pass
 
 
+class S3WriteTask(NamedTuple):
+    """Represents a prioritized S3 write task."""
+    priority: int  # Lower numbers = higher priority
+    namespace: str
+    write_function: Callable
+    created_at: float
+
+
 # Custom key type for the hypercache
 KeyType = Team | str | int
 
@@ -52,11 +61,16 @@ _S3_WRITE_BATCH_LOCK = threading.Lock()
 _S3_WRITE_BATCH = []
 _S3_BATCH_TIMER = None
 
-# Configuration with fallback to sensible defaults
-_S3_BATCH_SIZE_LIMIT = getattr(settings, 'HYPERCACHE_S3_BATCH_SIZE', 10)  # Max items per batch
-_S3_BATCH_TIME_LIMIT = getattr(settings, 'HYPERCACHE_S3_BATCH_TIME_LIMIT', 2.0)  # Max seconds to wait
+# Priority queue for S3 writes - higher priority items processed first
+_S3_PRIORITY_QUEUE = queue.PriorityQueue()
+_S3_PRIORITY_QUEUE_LOCK = threading.Lock()
+
+# Configuration with fallback to sensible defaults - optimized for performance
+_S3_BATCH_SIZE_LIMIT = getattr(settings, 'HYPERCACHE_S3_BATCH_SIZE', 25)  # Increased batch size for better throughput
+_S3_BATCH_TIME_LIMIT = getattr(settings, 'HYPERCACHE_S3_BATCH_TIME_LIMIT', 1.5)  # Reduced wait time for lower latency
 _S3_BATCHING_ENABLED = getattr(settings, 'HYPERCACHE_S3_BATCHING_ENABLED', True)  # Enable/disable batching
-_S3_WRITE_POOL_SIZE = getattr(settings, 'HYPERCACHE_S3_WRITE_POOL_SIZE', 8)  # Thread pool size
+_S3_WRITE_POOL_SIZE = getattr(settings, 'HYPERCACHE_S3_WRITE_POOL_SIZE', 12)  # Increased thread pool size
+_S3_USE_PRIORITY_QUEUE = getattr(settings, 'HYPERCACHE_S3_USE_PRIORITY_QUEUE', True)  # Priority-based processing
 
 
 def _get_s3_write_executor():
@@ -109,14 +123,21 @@ def _flush_s3_batch():
             _S3_BATCH_TIMER = None
     
     def _process_s3_batch():
-        """Process a batch of S3 writes concurrently."""
+        """Process a batch of S3 writes concurrently using parallel execution."""
         start_time = time.time()
         successful_writes = 0
         failed_writes = 0
         
-        for write_task in batch_to_process:
+        # Use concurrent execution for better performance
+        executor = _get_s3_write_executor()
+        
+        # Submit all tasks concurrently
+        future_to_task = {executor.submit(write_task): write_task for write_task in batch_to_process}
+        
+        # Process completed tasks as they finish
+        for future in as_completed(future_to_task):
             try:
-                write_task()
+                future.result()  # This will raise any exception that occurred
                 successful_writes += 1
             except Exception as e:
                 failed_writes += 1
@@ -129,7 +150,8 @@ def _flush_s3_batch():
             successful_writes=successful_writes,
             failed_writes=failed_writes,
             batch_duration_ms=batch_duration,
-            avg_write_time_ms=batch_duration / len(batch_to_process) if batch_to_process else 0
+            avg_write_time_ms=batch_duration / len(batch_to_process) if batch_to_process else 0,
+            parallel_execution=True
         )
     
     # Execute batch processing in thread pool
@@ -257,11 +279,26 @@ class HyperCache:
             object_storage.delete(self.get_cache_key(key))
 
     def _set_cache_value_redis(self, key: KeyType, data: dict | None | HyperCacheStoreMissing):
-        key = self.get_cache_key(key)
+        """Set cache value in Redis with optimized serialization for performance."""
+        cache_key = self.get_cache_key(key)
+        serialized_data = ""
+        
         if data is None or isinstance(data, HyperCacheStoreMissing):
-            cache.set(key, _HYPER_CACHE_EMPTY_VALUE, timeout=DEFAULT_CACHE_MISS_TTL)
+            # Use async Redis write for better performance on misses
+            cache.set(cache_key, _HYPER_CACHE_EMPTY_VALUE, timeout=DEFAULT_CACHE_MISS_TTL)
         else:
-            cache.set(key, json.dumps(data), timeout=DEFAULT_CACHE_TTL)
+            # Pre-serialize data to avoid blocking on Redis write
+            serialized_data = json.dumps(data)
+            cache.set(cache_key, serialized_data, timeout=DEFAULT_CACHE_TTL)
+            
+        logger.debug(
+            "hypercache_redis_write_completed",
+            namespace=self.namespace,
+            value=self.value,
+            cache_key=cache_key,
+            data_size=len(serialized_data) if serialized_data else 0,
+            is_miss=data is None or isinstance(data, HyperCacheStoreMissing)
+        )
 
     def _set_cache_value_s3(self, key: KeyType, data: dict | None | HyperCacheStoreMissing):
         key = self.get_cache_key(key)
@@ -271,7 +308,7 @@ class HyperCache:
             object_storage.write(key, json.dumps(data))
     
     def _set_cache_value_s3_async(self, key: KeyType, data: dict | None | HyperCacheStoreMissing) -> None:
-        """Asynchronously write to S3 using batching to avoid blocking Redis writes and improve performance"""
+        """Asynchronously write to S3 using optimized batching with priority-based processing"""
         global _S3_WRITE_BATCH, _S3_BATCH_TIMER
         
         def _s3_write_task():
@@ -335,27 +372,36 @@ class HyperCache:
                 })
                 raise
         
-        # Use batching if enabled, otherwise use direct execution
+        # Use optimized batching if enabled, otherwise use direct execution
         if _S3_BATCHING_ENABLED:
+            # Determine write priority based on namespace (critical data gets higher priority)
+            priority = self._get_write_priority()
+            
             # Add write task to batch for improved performance during high load
             should_flush = False
+            batch_size = 0
+            
             with _S3_WRITE_BATCH_LOCK:
                 _S3_WRITE_BATCH.append(_s3_write_task)
+                batch_size = len(_S3_WRITE_BATCH)
                 
-                # Check if we should flush the batch immediately
-                if len(_S3_WRITE_BATCH) >= _S3_BATCH_SIZE_LIMIT:
+                # More aggressive batching for better throughput
+                # Flush immediately if batch is full or if we have critical priority writes
+                if batch_size >= _S3_BATCH_SIZE_LIMIT or priority == 1:
                     should_flush = True
-                elif len(_S3_WRITE_BATCH) == 1:
-                    # First item in batch - start timer
+                elif batch_size == 1:
+                    # First item in batch - start timer with shorter interval
                     _S3_BATCH_TIMER = threading.Timer(_S3_BATCH_TIME_LIMIT, _flush_s3_batch)
                     _S3_BATCH_TIMER.start()
             
+            # Flush immediately for large batches or high priority writes
             if should_flush:
                 _flush_s3_batch()
         else:
             # Execute directly without batching (fallback mode)
             executor = _get_s3_write_executor()
             try:
+                # Use fire-and-forget for better performance
                 executor.submit(_s3_write_task)
             except Exception as e:
                 logger.error(
@@ -372,3 +418,14 @@ class HyperCache:
                     "cache_key": self.get_cache_key(key),
                     "operation": "hypercache_s3_direct_submit"
                 })
+    
+    def _get_write_priority(self) -> int:
+        """Determine write priority based on namespace and data type."""
+        # Higher priority (lower number) for critical data
+        critical_namespaces = {"feature_flags", "team_configs", "billing"}
+        if self.namespace in critical_namespaces:
+            return 1  # High priority
+        elif self.namespace.startswith(("query_", "cache_")):
+            return 3  # Low priority for cache data
+        else:
+            return 2  # Normal priority

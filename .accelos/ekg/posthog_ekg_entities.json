@@ -1,0 +1,381 @@
+{
+  "extraction_metadata": {
+    "timestamp": "2025-08-19T02:30:00Z",
+    "repository": "https://github.com/posthog/posthog.git",
+    "extractor": "manual_analysis",
+    "version": "1.0"
+  },
+  "entities": {
+    "code_repositories": [
+      {
+        "name": "posthog",
+        "url": "https://github.com/posthog/posthog.git",
+        "type": "app_and_infra",
+        "languages": ["Python", "TypeScript", "JavaScript", "Rust", "Node.js"],
+        "frameworks": ["Django", "React", "Next.js", "Axum", "Tokio"],
+        "description": "PostHog is an all-in-one, open source platform for building successful products",
+        "package_managers": ["pnpm", "uv", "cargo"],
+        "monorepo": true
+      }
+    ],
+    "services": [
+      {
+        "name": "web_service",
+        "type": "app_backend",
+        "ports": ["8000"],
+        "languages": ["Python"],
+        "frameworks": ["Django", "Django REST Framework"],
+        "command": "./bin/start-backend & ./bin/start-frontend",
+        "interfaces": ["/Users/sidchoudhury/topcorp/posthog/posthog/api/__init__.py"]
+      },
+      {
+        "name": "capture_service", 
+        "type": "app_backend",
+        "ports": ["3000"],
+        "languages": ["Rust"],
+        "frameworks": ["Axum", "Tokio"],
+        "capture_mode": "events",
+        "binary_path": "rust/capture"
+      },
+      {
+        "name": "replay_capture_service",
+        "type": "app_backend", 
+        "ports": ["3000"],
+        "languages": ["Rust"],
+        "frameworks": ["Axum", "Tokio"],
+        "capture_mode": "recordings",
+        "binary_path": "rust/capture"
+      },
+      {
+        "name": "feature_flags_service",
+        "type": "app_backend",
+        "ports": ["3001"],
+        "languages": ["Rust"],
+        "frameworks": ["Axum", "Tokio"],
+        "binary_path": "rust/feature-flags"
+      },
+      {
+        "name": "plugins_service",
+        "type": "app_backend",
+        "ports": ["6738"],
+        "languages": ["Node.js", "TypeScript"],
+        "command": "./bin/plugin-server --no-restart-loop",
+        "package_path": "plugin-server"
+      },
+      {
+        "name": "property_defs_service",
+        "type": "app_backend",
+        "languages": ["Rust"],
+        "frameworks": ["Axum", "Tokio"],
+        "binary_path": "rust/property-defs-rs"
+      },
+      {
+        "name": "livestream_service",
+        "type": "app_backend",
+        "ports": ["8080"],
+        "image": "ghcr.io/posthog/livestream:main"
+      },
+      {
+        "name": "temporal_django_worker",
+        "type": "app_backend",
+        "languages": ["Python"],
+        "frameworks": ["Django", "Temporal"],
+        "command": "./bin/temporal-django-worker"
+      },
+      {
+        "name": "cyclotron_janitor",
+        "type": "app_backend",
+        "languages": ["Rust"],
+        "frameworks": ["Tokio"],
+        "binary_path": "rust/cyclotron-janitor"
+      },
+      {
+        "name": "proxy_service",
+        "type": "self_managed_infra",
+        "ports": ["8000"],
+        "image": "caddy",
+        "purpose": "reverse_proxy"
+      },
+      {
+        "name": "worker_service",
+        "type": "app_backend",
+        "languages": ["Python"],
+        "frameworks": ["Django", "Celery"],
+        "command": "./bin/docker-worker-celery --with-scheduler"
+      },
+      {
+        "name": "flower_service",
+        "type": "self_managed_infra",
+        "ports": ["5555"],
+        "image": "mher/flower:2.0.0",
+        "purpose": "celery_monitoring"
+      }
+    ],
+    "resources": [
+      {
+        "name": "postgres_db",
+        "provider": "self-managed",
+        "managed_by": "self",
+        "type": "database",
+        "subtype": "postgresql",
+        "version": "12-alpine",
+        "ports": ["5432"],
+        "database_name": "posthog"
+      },
+      {
+        "name": "counters_db", 
+        "provider": "self-managed",
+        "managed_by": "self",
+        "type": "database",
+        "subtype": "postgresql", 
+        "version": "12-alpine",
+        "ports": ["5432"],
+        "database_name": "counters"
+      },
+      {
+        "name": "clickhouse_db",
+        "provider": "self-managed", 
+        "managed_by": "self",
+        "type": "database",
+        "subtype": "clickhouse",
+        "version": "25.3.6.56",
+        "ports": ["8123", "9000", "9440"],
+        "database_name": "posthog"
+      },
+      {
+        "name": "redis_cache",
+        "provider": "self-managed",
+        "managed_by": "self", 
+        "type": "cache",
+        "subtype": "redis",
+        "version": "6.2.7-alpine",
+        "ports": ["6379"],
+        "memory_policy": "allkeys-lru"
+      },
+      {
+        "name": "redis7_cache",
+        "provider": "self-managed",
+        "managed_by": "self",
+        "type": "cache", 
+        "subtype": "redis",
+        "version": "7.2-alpine",
+        "ports": ["6379"],
+        "memory_policy": "allkeys-lru"
+      },
+      {
+        "name": "kafka_queue",
+        "provider": "self-managed",
+        "managed_by": "self",
+        "type": "stream",
+        "subtype": "redpanda",
+        "version": "v25.1.9",
+        "ports": ["9092", "19092", "8082", "8081"],
+        "compatible_with": "kafka"
+      },
+      {
+        "name": "zookeeper_coordinator",
+        "provider": "self-managed", 
+        "managed_by": "self",
+        "type": "coordination",
+        "subtype": "zookeeper",
+        "version": "3.7.0",
+        "ports": ["2181"]
+      },
+      {
+        "name": "object_storage",
+        "provider": "self-managed",
+        "managed_by": "self", 
+        "type": "storage",
+        "subtype": "s3_compatible",
+        "image": "minio/minio",
+        "ports": ["19000", "19001"],
+        "bucket": "posthog"
+      },
+      {
+        "name": "temporal_workflow",
+        "provider": "self-managed",
+        "managed_by": "self",
+        "type": "workflow", 
+        "subtype": "temporal",
+        "version": "1.20.0",
+        "ports": ["7233"]
+      },
+      {
+        "name": "elasticsearch_search",
+        "provider": "self-managed",
+        "managed_by": "self",
+        "type": "search",
+        "subtype": "elasticsearch", 
+        "version": "7.17.27",
+        "ports": ["9200"]
+      },
+      {
+        "name": "jaeger_tracing",
+        "provider": "self-managed",
+        "managed_by": "self",
+        "type": "observability",
+        "subtype": "tracing",
+        "ports": ["16686", "14268", "14250"]
+      },
+      {
+        "name": "otel_collector",
+        "provider": "self-managed", 
+        "managed_by": "self",
+        "type": "observability",
+        "subtype": "telemetry_collector",
+        "ports": ["4317", "4318", "13133", "55679"]
+      }
+    ],
+    "artifacts": [
+      {
+        "name": "posthog_docker_image",
+        "built_by": "self",
+        "output_type": "container",
+        "registries": ["ghcr.io/posthog/posthog", "posthog/posthog"],
+        "platforms": ["linux/arm64", "linux/amd64"],
+        "build_stages": ["frontend-build", "plugin-server-build", "posthog-build", "fetch-geoip-db"]
+      },
+      {
+        "name": "capture_rust_binary",
+        "built_by": "self", 
+        "output_type": "binary",
+        "code_files": ["rust/capture/**"],
+        "language": "rust",
+        "build_command": "cargo build --release"
+      },
+      {
+        "name": "frontend_assets",
+        "built_by": "self",
+        "output_type": "static_assets", 
+        "code_files": ["frontend/src/**", "products/**"],
+        "build_command": "pnpm build",
+        "bundler": "esbuild"
+      }
+    ],
+    "tools": [
+      {
+        "name": "turbo",
+        "type": "build",
+        "version": "2.4.2", 
+        "purpose": "monorepo_build_orchestration"
+      },
+      {
+        "name": "pnpm",
+        "type": "manage_package",
+        "version": "9.15.5",
+        "purpose": "nodejs_package_management"
+      },
+      {
+        "name": "uv",
+        "type": "manage_package", 
+        "version": "0.7.0",
+        "purpose": "python_package_management"
+      },
+      {
+        "name": "cargo",
+        "type": "build",
+        "purpose": "rust_compilation"
+      },
+      {
+        "name": "esbuild",
+        "type": "build",
+        "purpose": "javascript_bundling"
+      },
+      {
+        "name": "jest",
+        "type": "test",
+        "purpose": "javascript_unit_testing"
+      },
+      {
+        "name": "pytest", 
+        "type": "test",
+        "purpose": "python_unit_testing"
+      },
+      {
+        "name": "ruff",
+        "type": "lint",
+        "purpose": "python_linting_formatting"
+      },
+      {
+        "name": "oxlint",
+        "type": "lint", 
+        "purpose": "javascript_typescript_linting"
+      },
+      {
+        "name": "prettier",
+        "type": "lint",
+        "purpose": "code_formatting"
+      },
+      {
+        "name": "stylelint",
+        "type": "lint",
+        "purpose": "css_linting"
+      },
+      {
+        "name": "typescript",
+        "type": "lint",
+        "version": "5.2.2",
+        "purpose": "typescript_type_checking"
+      },
+      {
+        "name": "docker_compose",
+        "type": "containerize",
+        "purpose": "local_development_orchestration"
+      },
+      {
+        "name": "github_actions",
+        "type": "ci_cd",
+        "purpose": "continuous_integration_deployment"
+      },
+      {
+        "name": "caddy",
+        "type": "build", 
+        "purpose": "reverse_proxy_load_balancing"
+      }
+    ],
+    "ci_cd_pipelines": [
+      {
+        "name": "backend_ci",
+        "pipeline_type": "test",
+        "triggers": ["push", "pull_request"],
+        "stages": ["changes", "check-migrations", "django", "async-migrations"],
+        "test_matrix": {
+          "python_version": "3.11.9", 
+          "clickhouse_version": "25.3.6.56",
+          "concurrency": 40
+        }
+      },
+      {
+        "name": "frontend_ci",
+        "pipeline_type": "test",
+        "triggers": ["push", "pull_request"],
+        "stages": ["changes", "frontend-format", "frontend-typescript-checks", "jest"],
+        "test_matrix": {
+          "segments": ["FOSS", "EE"],
+          "chunks": 3
+        }
+      },
+      {
+        "name": "container_images_cd",
+        "pipeline_type": "deployment", 
+        "triggers": ["push"],
+        "stages": ["posthog_build"],
+        "outputs": ["docker_images", "cloud_deployment_trigger"]
+      }
+    ],
+    "environments": [
+      {
+        "name": "development",
+        "environment_type": "dev",
+        "orchestration": "docker_compose",
+        "config_files": ["docker-compose.dev.yml", "docker-compose.base.yml"]
+      },
+      {
+        "name": "production_cloud",
+        "environment_type": "prod", 
+        "provider": "posthog_cloud",
+        "deployment_method": "kubernetes_helm"
+      }
+    ]
+  }
+}

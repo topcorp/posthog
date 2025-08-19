@@ -6,8 +6,28 @@ from boto3 import client
 from botocore.client import Config
 from django.conf import settings
 from posthog.exceptions_capture import capture_exception
+from prometheus_client import Counter, Histogram
 
 logger = structlog.get_logger(__name__)
+
+# Metrics for monitoring S3 operations
+S3_WRITE_COUNTER = Counter(
+    "posthog_s3_write_requests_total",
+    "Total number of S3 write requests", 
+    labelnames=["result", "bucket", "operation"]
+)
+
+S3_WRITE_DURATION_HISTOGRAM = Histogram(
+    "posthog_s3_write_duration_seconds",
+    "Duration of S3 write operations",
+    labelnames=["bucket", "operation"]
+)
+
+S3_ERROR_COUNTER = Counter(
+    "posthog_s3_errors_total",
+    "Total number of S3 errors by error type and operation",
+    labelnames=["error_type", "operation", "bucket", "aws_error_code"]
+)
 
 
 class ObjectStorageError(Exception):
@@ -178,18 +198,43 @@ class ObjectStorage(ObjectStorageClient):
 
     def read_bytes(self, bucket: str, key: str) -> Optional[bytes]:
         s3_response = {}
+        operation = "get_object"
+        
         try:
-            s3_response = self.aws_client.get_object(Bucket=bucket, Key=key)
+            with S3_WRITE_DURATION_HISTOGRAM.labels(bucket=bucket, operation=operation).time():
+                s3_response = self.aws_client.get_object(Bucket=bucket, Key=key)
+            
+            S3_WRITE_COUNTER.labels(result="success", bucket=bucket, operation=operation).inc()
             return s3_response["Body"].read()
         except Exception as e:
+            # Record failure metrics
+            S3_WRITE_COUNTER.labels(result="failure", bucket=bucket, operation=operation).inc()
+            
+            aws_error_code = "unknown"
+            if hasattr(e, 'response') and isinstance(e.response, dict):
+                aws_error_code = e.response.get('Error', {}).get('Code', 'unknown')
+            
+            S3_ERROR_COUNTER.labels(
+                error_type=type(e).__name__,
+                operation=operation,
+                bucket=bucket,
+                aws_error_code=aws_error_code
+            ).inc()
+            
             logger.exception(
                 "object_storage.read_failed",
                 bucket=bucket,
                 file_name=key,
                 error=e,
                 s3_response=s3_response,
+                aws_error_code=aws_error_code,
             )
-            capture_exception(e)
+            capture_exception(e, extra_data={
+                "bucket": bucket,
+                "key": key,
+                "operation": "s3_read",
+                "aws_error_code": aws_error_code
+            })
             raise ObjectStorageError("read failed") from e
 
     def tag(self, bucket: str, key: str, tags: dict[str, str]) -> None:
@@ -208,10 +253,16 @@ class ObjectStorage(ObjectStorageClient):
         s3_response = {}
         content_size = len(content) if content else 0
         start_time = None
+        operation = "put_object"
+        
         try:
             import time
             start_time = time.time()
-            s3_response = self.aws_client.put_object(Bucket=bucket, Body=content, Key=key, **(extras or {}))
+            with S3_WRITE_DURATION_HISTOGRAM.labels(bucket=bucket, operation=operation).time():
+                s3_response = self.aws_client.put_object(Bucket=bucket, Body=content, Key=key, **(extras or {}))
+            
+            # Record successful write metrics
+            S3_WRITE_COUNTER.labels(result="success", bucket=bucket, operation=operation).inc()
             
             # Log successful write with timing information
             write_duration = (time.time() - start_time) * 1000  # Convert to milliseconds
@@ -225,6 +276,20 @@ class ObjectStorage(ObjectStorageClient):
                 extras=extras,
             )
         except Exception as e:
+            # Record failure metrics
+            S3_WRITE_COUNTER.labels(result="failure", bucket=bucket, operation=operation).inc()
+            
+            aws_error_code = "unknown"
+            if hasattr(e, 'response') and isinstance(e.response, dict):
+                aws_error_code = e.response.get('Error', {}).get('Code', 'unknown')
+            
+            S3_ERROR_COUNTER.labels(
+                error_type=type(e).__name__,
+                operation=operation,
+                bucket=bucket,
+                aws_error_code=aws_error_code
+            ).inc()
+            
             write_duration = ((time.time() - start_time) * 1000) if start_time else None
             logger.exception(
                 "object_storage.write_failed",
@@ -237,13 +302,16 @@ class ObjectStorage(ObjectStorageClient):
                 extras=extras,
                 s3_response=s3_response,
                 aws_retry_info=getattr(e, 'operation_name', None),
+                aws_error_code=aws_error_code,
             )
             capture_exception(e, extra_data={
                 "bucket": bucket,
                 "key": key,
                 "content_size": content_size,
                 "error_type": type(e).__name__,
-                "extras": extras
+                "extras": extras,
+                "operation": "s3_write",
+                "aws_error_code": aws_error_code
             })
             raise ObjectStorageError(f"write failed for key '{key}' in bucket '{bucket}': {str(e)}") from e
 
@@ -269,11 +337,42 @@ class ObjectStorage(ObjectStorageClient):
 
     def delete(self, bucket: str, key: str) -> None:
         response = {}
+        operation = "delete_object"
+        
         try:
-            response = self.aws_client.delete_object(Bucket=bucket, Key=key)
+            with S3_WRITE_DURATION_HISTOGRAM.labels(bucket=bucket, operation=operation).time():
+                response = self.aws_client.delete_object(Bucket=bucket, Key=key)
+            
+            S3_WRITE_COUNTER.labels(result="success", bucket=bucket, operation=operation).inc()
         except Exception as e:
-            logger.exception("object_storage.delete_failed", bucket=bucket, key=key, error=e, s3_response=response)
-            capture_exception(e)
+            # Record failure metrics
+            S3_WRITE_COUNTER.labels(result="failure", bucket=bucket, operation=operation).inc()
+            
+            aws_error_code = "unknown"
+            if hasattr(e, 'response') and isinstance(e.response, dict):
+                aws_error_code = e.response.get('Error', {}).get('Code', 'unknown')
+            
+            S3_ERROR_COUNTER.labels(
+                error_type=type(e).__name__,
+                operation=operation,
+                bucket=bucket,
+                aws_error_code=aws_error_code
+            ).inc()
+            
+            logger.exception(
+                "object_storage.delete_failed", 
+                bucket=bucket, 
+                key=key, 
+                error=e, 
+                s3_response=response,
+                aws_error_code=aws_error_code
+            )
+            capture_exception(e, extra_data={
+                "bucket": bucket,
+                "key": key,
+                "operation": "s3_delete",
+                "aws_error_code": aws_error_code
+            })
             raise ObjectStorageError("delete failed") from e
 
 

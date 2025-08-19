@@ -1,0 +1,31 @@
+{
+  "mcpServers": {
+    "ekg-extractor": {
+      "command": "python",
+      "args": [
+        "-m",
+        "ekg.src.agentic.mcp_server.stdio_server",
+        "--subagent",
+        "ekg-extractor",
+        "--output-dir",
+        "/Users/sidchoudhury/topcorp/posthog/.accelos/ekg/by_agent_ekg_extractor",
+        "--input-path",
+        "/Users/sidchoudhury/topcorp/posthog",
+        "--log-level",
+        "DEBUG"
+      ],
+      "env": {
+        "PYTHONPATH": "/Users/sidchoudhury/accelos/a0"
+      },
+      "disabled": false,
+      "alwaysAllow": [
+        "create_or_update_entities",
+        "create_or_update_relations",
+        "recreate_entities",
+        "recreate_relations",
+        "write_graph_to_jsonl",
+        "get_feedback_on_current_graph"
+      ]
+    }
+  }
+}

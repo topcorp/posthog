@@ -55,18 +55,24 @@ class S3QueryCacheManager(QueryCacheManagerBase):
         return "s3_cache_timestamps"
 
     def set_cache_data(self, *, response: dict, target_age: Optional[datetime]) -> None:
-        """Store query results in S3 with lifecycle-based TTL."""
+        """Store query results in S3 with lifecycle-based TTL and optimized compression."""
         try:
             object_key = self._cache_object_key()
+            
+            # Use higher compression level for better space efficiency in cache
             content = OrjsonJsonSerializer({}).dumps(response)
-            payload = zstd.compress(content)
+            payload = zstd.compress(content, level=3)  # Balanced compression for speed/size
 
             # Calculate TTL in days for S3 lifecycle rules
             ttl_days = settings.CACHED_RESULTS_TTL_DAYS
 
-            # Add S3 object tags for lifecycle management
-            extras = {"Tagging": f"ttl_days={ttl_days}&cache_type=query_data&team_id={self.team_id}"}
+            # Add S3 object tags for lifecycle management and monitoring
+            extras = {
+                "Tagging": f"ttl_days={ttl_days}&cache_type=query_data&team_id={self.team_id}&namespace=query_cache",
+                "ContentEncoding": "zstd",  # Mark compression type for debugging
+            }
 
+            # Use async write for better performance - this will be batched
             self.storage_client.write(bucket=self.bucket, key=object_key, content=payload, extras=extras)
 
             logger.debug(

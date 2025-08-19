@@ -1,0 +1,346 @@
+{
+  "relationships": {
+    "path_to_production": [
+      {
+        "type": "builds",
+        "source": {"name": "posthog", "type": "code_repo"},
+        "target": {"name": "posthog_docker_image", "type": "artifact"},
+        "pipeline": {"name": "container_images_cd", "type": "ci_cd_pipeline"}
+      },
+      {
+        "type": "builds", 
+        "source": {"name": "posthog", "type": "code_repo"},
+        "target": {"name": "frontend_assets", "type": "artifact"},
+        "pipeline": {"name": "frontend_ci", "type": "ci_cd_pipeline"}
+      },
+      {
+        "type": "builds",
+        "source": {"name": "posthog", "type": "code_repo"}, 
+        "target": {"name": "capture_rust_binary", "type": "artifact"},
+        "pipeline": {"name": "rust_ci", "type": "ci_cd_pipeline"}
+      },
+      {
+        "type": "deployed_as",
+        "source": {"name": "posthog_docker_image", "type": "artifact"},
+        "target": {"name": "web_service", "type": "service"},
+        "pipeline": {"name": "container_images_cd", "type": "ci_cd_pipeline"}
+      },
+      {
+        "type": "deployed_as",
+        "source": {"name": "capture_rust_binary", "type": "artifact"}, 
+        "target": {"name": "capture_service", "type": "service"},
+        "pipeline": {"name": "rust_docker_build", "type": "ci_cd_pipeline"}
+      },
+      {
+        "type": "deployed_as",
+        "source": {"name": "capture_rust_binary", "type": "artifact"},
+        "target": {"name": "replay_capture_service", "type": "service"},
+        "pipeline": {"name": "rust_docker_build", "type": "ci_cd_pipeline"}
+      },
+      {
+        "type": "deployed_to",
+        "source": {"name": "web_service", "type": "service"},
+        "target": {"name": "development", "type": "environment"},
+        "method": "docker_compose"
+      },
+      {
+        "type": "deployed_to",
+        "source": {"name": "web_service", "type": "service"},
+        "target": {"name": "production_cloud", "type": "environment"},
+        "method": "kubernetes_helm"
+      }
+    ],
+    "service_dependencies": [
+      {
+        "type": "uses",
+        "source": {"name": "web_service", "type": "service"},
+        "target": {"name": "postgres_db", "type": "resource"},
+        "connection_type": "database"
+      },
+      {
+        "type": "uses", 
+        "source": {"name": "web_service", "type": "service"},
+        "target": {"name": "redis_cache", "type": "resource"},
+        "connection_type": "cache"
+      },
+      {
+        "type": "uses",
+        "source": {"name": "web_service", "type": "service"},
+        "target": {"name": "clickhouse_db", "type": "resource"},
+        "connection_type": "analytics_database"
+      },
+      {
+        "type": "uses",
+        "source": {"name": "capture_service", "type": "service"},
+        "target": {"name": "kafka_queue", "type": "resource"}, 
+        "connection_type": "event_stream"
+      },
+      {
+        "type": "uses",
+        "source": {"name": "capture_service", "type": "service"},
+        "target": {"name": "redis_cache", "type": "resource"},
+        "connection_type": "cache"
+      },
+      {
+        "type": "uses",
+        "source": {"name": "replay_capture_service", "type": "service"},
+        "target": {"name": "kafka_queue", "type": "resource"},
+        "connection_type": "event_stream"
+      },
+      {
+        "type": "uses",
+        "source": {"name": "feature_flags_service", "type": "service"},
+        "target": {"name": "postgres_db", "type": "resource"}, 
+        "connection_type": "database"
+      },
+      {
+        "type": "uses",
+        "source": {"name": "feature_flags_service", "type": "service"},
+        "target": {"name": "redis_cache", "type": "resource"},
+        "connection_type": "cache"
+      },
+      {
+        "type": "uses",
+        "source": {"name": "plugins_service", "type": "service"},
+        "target": {"name": "postgres_db", "type": "resource"},
+        "connection_type": "database"
+      },
+      {
+        "type": "uses",
+        "source": {"name": "plugins_service", "type": "service"},
+        "target": {"name": "clickhouse_db", "type": "resource"},
+        "connection_type": "analytics_database"
+      },
+      {
+        "type": "uses",
+        "source": {"name": "plugins_service", "type": "service"},
+        "target": {"name": "kafka_queue", "type": "resource"},
+        "connection_type": "event_stream" 
+      },
+      {
+        "type": "uses",
+        "source": {"name": "plugins_service", "type": "service"},
+        "target": {"name": "redis_cache", "type": "resource"},
+        "connection_type": "cache"
+      },
+      {
+        "type": "uses",
+        "source": {"name": "plugins_service", "type": "service"},
+        "target": {"name": "counters_db", "type": "resource"},
+        "connection_type": "database"
+      },
+      {
+        "type": "uses",
+        "source": {"name": "worker_service", "type": "service"}, 
+        "target": {"name": "postgres_db", "type": "resource"},
+        "connection_type": "database"
+      },
+      {
+        "type": "uses",
+        "source": {"name": "worker_service", "type": "service"},
+        "target": {"name": "redis_cache", "type": "resource"},
+        "connection_type": "celery_broker"
+      },
+      {
+        "type": "uses",
+        "source": {"name": "worker_service", "type": "service"},
+        "target": {"name": "clickhouse_db", "type": "resource"},
+        "connection_type": "analytics_database"
+      },
+      {
+        "type": "uses",
+        "source": {"name": "temporal_django_worker", "type": "service"},
+        "target": {"name": "temporal_workflow", "type": "resource"},
+        "connection_type": "workflow_client"
+      },
+      {
+        "type": "uses",
+        "source": {"name": "temporal_django_worker", "type": "service"},
+        "target": {"name": "postgres_db", "type": "resource"},
+        "connection_type": "database"
+      },
+      {
+        "type": "uses",
+        "source": {"name": "cyclotron_janitor", "type": "service"},
+        "target": {"name": "postgres_db", "type": "resource"},
+        "connection_type": "database" 
+      },
+      {
+        "type": "uses",
+        "source": {"name": "cyclotron_janitor", "type": "service"},
+        "target": {"name": "kafka_queue", "type": "resource"},
+        "connection_type": "event_stream"
+      },
+      {
+        "type": "uses",
+        "source": {"name": "flower_service", "type": "service"},
+        "target": {"name": "redis_cache", "type": "resource"},
+        "connection_type": "celery_monitoring"
+      }
+    ],
+    "infrastructure_dependencies": [
+      {
+        "type": "uses",
+        "source": {"name": "kafka_queue", "type": "resource"},
+        "target": {"name": "zookeeper_coordinator", "type": "resource"},
+        "connection_type": "coordination"
+      },
+      {
+        "type": "uses", 
+        "source": {"name": "clickhouse_db", "type": "resource"},
+        "target": {"name": "kafka_queue", "type": "resource"},
+        "connection_type": "event_ingestion"
+      },
+      {
+        "type": "uses",
+        "source": {"name": "clickhouse_db", "type": "resource"},
+        "target": {"name": "zookeeper_coordinator", "type": "resource"},
+        "connection_type": "replication_coordination"
+      },
+      {
+        "type": "uses",
+        "source": {"name": "temporal_workflow", "type": "resource"},
+        "target": {"name": "postgres_db", "type": "resource"},
+        "connection_type": "workflow_state_storage"
+      },
+      {
+        "type": "uses",
+        "source": {"name": "temporal_workflow", "type": "resource"},
+        "target": {"name": "elasticsearch_search", "type": "resource"},
+        "connection_type": "workflow_search_indexing"
+      },
+      {
+        "type": "uses",
+        "source": {"name": "otel_collector", "type": "resource"},
+        "target": {"name": "jaeger_tracing", "type": "resource"}, 
+        "connection_type": "trace_forwarding"
+      }
+    ],
+    "proxy_routing": [
+      {
+        "type": "routes_to",
+        "source": {"name": "proxy_service", "type": "service"},
+        "target": {"name": "web_service", "type": "service"},
+        "path_pattern": "/*"
+      },
+      {
+        "type": "routes_to",
+        "source": {"name": "proxy_service", "type": "service"}, 
+        "target": {"name": "capture_service", "type": "service"},
+        "path_pattern": "/e, /e/*, /i/v0/*, /batch, /capture"
+      },
+      {
+        "type": "routes_to",
+        "source": {"name": "proxy_service", "type": "service"},
+        "target": {"name": "replay_capture_service", "type": "service"},
+        "path_pattern": "/s, /s/*"
+      },
+      {
+        "type": "routes_to",
+        "source": {"name": "proxy_service", "type": "service"},
+        "target": {"name": "feature_flags_service", "type": "service"},
+        "path_pattern": "/flags, /flags/*"
+      },
+      {
+        "type": "routes_to",
+        "source": {"name": "proxy_service", "type": "service"},
+        "target": {"name": "plugins_service", "type": "service"},
+        "path_pattern": "/public/webhooks, /public/webhooks/*"
+      }
+    ],
+    "tool_usage": [
+      {
+        "type": "used_by",
+        "source": {"name": "turbo", "type": "tool"},
+        "target": {"name": "posthog", "type": "code_repo"},
+        "purpose": "monorepo_build_coordination"
+      },
+      {
+        "type": "used_by",
+        "source": {"name": "pnpm", "type": "tool"},
+        "target": {"name": "posthog", "type": "code_repo"},
+        "purpose": "nodejs_package_management"
+      },
+      {
+        "type": "used_by",
+        "source": {"name": "uv", "type": "tool"},
+        "target": {"name": "posthog", "type": "code_repo"},
+        "purpose": "python_dependency_management"
+      },
+      {
+        "type": "used_by",
+        "source": {"name": "cargo", "type": "tool"},
+        "target": {"name": "posthog", "type": "code_repo"},
+        "purpose": "rust_compilation"
+      },
+      {
+        "type": "used_by",
+        "source": {"name": "esbuild", "type": "tool"},
+        "target": {"name": "frontend_assets", "type": "artifact"},
+        "purpose": "javascript_bundling"
+      },
+      {
+        "type": "used_by",
+        "source": {"name": "jest", "type": "tool"},
+        "target": {"name": "frontend_ci", "type": "ci_cd_pipeline"},
+        "purpose": "frontend_unit_testing"
+      },
+      {
+        "type": "used_by", 
+        "source": {"name": "pytest", "type": "tool"},
+        "target": {"name": "backend_ci", "type": "ci_cd_pipeline"},
+        "purpose": "backend_unit_testing"
+      },
+      {
+        "type": "used_by",
+        "source": {"name": "ruff", "type": "tool"},
+        "target": {"name": "posthog", "type": "code_repo"},
+        "purpose": "python_linting_formatting"
+      },
+      {
+        "type": "used_by",
+        "source": {"name": "oxlint", "type": "tool"},
+        "target": {"name": "posthog", "type": "code_repo"},
+        "purpose": "javascript_typescript_linting"
+      },
+      {
+        "type": "used_by",
+        "source": {"name": "docker_compose", "type": "tool"},
+        "target": {"name": "development", "type": "environment"},
+        "purpose": "local_development_orchestration"
+      },
+      {
+        "type": "used_by",
+        "source": {"name": "github_actions", "type": "tool"},
+        "target": {"name": "backend_ci", "type": "ci_cd_pipeline"},
+        "purpose": "continuous_integration"
+      },
+      {
+        "type": "used_by",
+        "source": {"name": "github_actions", "type": "tool"},
+        "target": {"name": "frontend_ci", "type": "ci_cd_pipeline"},
+        "purpose": "continuous_integration"
+      },
+      {
+        "type": "used_by",
+        "source": {"name": "github_actions", "type": "tool"},
+        "target": {"name": "container_images_cd", "type": "ci_cd_pipeline"},
+        "purpose": "continuous_deployment"
+      }
+    ],
+    "pipeline_dependencies": [
+      {
+        "type": "depends_on",
+        "source": {"name": "container_images_cd", "type": "ci_cd_pipeline"},
+        "target": {"name": "backend_ci", "type": "ci_cd_pipeline"},
+        "dependency_type": "success_required"
+      },
+      {
+        "type": "depends_on",
+        "source": {"name": "container_images_cd", "type": "ci_cd_pipeline"},
+        "target": {"name": "frontend_ci", "type": "ci_cd_pipeline"},
+        "dependency_type": "success_required"
+      }
+    ]
+  }
+}
