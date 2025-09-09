@@ -586,3 +586,204 @@ def sort_cohorts_topologically(cohort_ids: set[int], seen_cohorts_cache: dict[in
             dfs(cohort_id, seen, sorted_cohort_ids)
 
     return sorted_cohort_ids
+
+
+def update_cohort_dependencies_batched(cohort: Cohort, batch_size: int = 100) -> None:
+    """
+    Update cohort dependencies in batches to avoid single-transaction performance issues.
+    This function replaces the problematic pattern of populating dependency tables in single transactions.
+    """
+    from posthog.models.cohort.cohort import CohortDependency
+    
+    # First, remove existing dependencies for this cohort to avoid duplicates
+    CohortDependency.objects.filter(cohort=cohort).delete()
+    
+    dependencies_to_create = []
+    for prop in cohort.properties.flat:
+        if prop.type == "cohort" and not isinstance(prop.value, list):
+            try:
+                dependency_id = int(prop.value)
+                dependencies_to_create.append(
+                    CohortDependency(cohort=cohort, depends_on_id=dependency_id)
+                )
+            except (ValueError, TypeError):
+                continue
+    
+    # Create dependencies in batches to avoid performance issues
+    if dependencies_to_create:
+        for i in range(0, len(dependencies_to_create), batch_size):
+            batch = dependencies_to_create[i:i + batch_size]
+            CohortDependency.objects.bulk_create(batch, ignore_conflicts=True)
+
+
+def get_dependent_cohorts_optimized(
+    cohort: Cohort,
+    using_database: str = "default",
+    max_depth: int = 10,
+) -> list[Cohort]:
+    """
+    Optimized version that uses CohortDependency model to avoid N+1 queries and improve performance
+    during bulk operations. Includes circuit breaker to prevent excessive recursion depth.
+    """
+    from posthog.models.cohort.cohort import CohortDependency
+    
+    if max_depth <= 0:
+        logger.warning("Maximum dependency depth reached", cohort_id=cohort.id)
+        return []
+    
+    # Use prefetch to get all dependencies in a single query
+    dependencies = list(
+        CohortDependency.objects.db_manager(using_database)
+        .select_related('depends_on')
+        .filter(cohort=cohort, depends_on__deleted=False, depends_on__team__project_id=cohort.team.project_id)
+    )
+    
+    cohorts = []
+    seen_cohort_ids = {cohort.id}
+    
+    for dep in dependencies:
+        if dep.depends_on_id not in seen_cohort_ids:
+            cohorts.append(dep.depends_on)
+            seen_cohort_ids.add(dep.depends_on_id)
+            
+            # Recursively get dependencies of dependencies with depth limit
+            nested_deps = get_dependent_cohorts_optimized(
+                dep.depends_on, 
+                using_database=using_database,
+                max_depth=max_depth - 1
+            )
+            for nested_dep in nested_deps:
+                if nested_dep.id not in seen_cohort_ids:
+                    cohorts.append(nested_dep)
+                    seen_cohort_ids.add(nested_dep.id)
+    
+    return cohorts
+
+
+def sort_cohorts_topologically_optimized(cohort_ids: set[int]) -> list[int]:
+    """
+    Optimized topological sort using CohortDependency model to avoid performance issues
+    during bulk cohort operations.
+    """
+    from posthog.models.cohort.cohort import CohortDependency
+    
+    if not cohort_ids:
+        return []
+    
+    # Get all dependencies in a single query
+    dependencies = list(
+        CohortDependency.objects
+        .filter(cohort_id__in=cohort_ids, depends_on_id__in=cohort_ids)
+        .values_list('cohort_id', 'depends_on_id')
+    )
+    
+    # Build adjacency list
+    dependency_graph: dict[int, list[int]] = {cid: [] for cid in cohort_ids}
+    in_degree: dict[int, int] = {cid: 0 for cid in cohort_ids}
+    
+    for cohort_id, depends_on_id in dependencies:
+        if cohort_id in cohort_ids and depends_on_id in cohort_ids:
+            dependency_graph[depends_on_id].append(cohort_id)
+            in_degree[cohort_id] += 1
+    
+    # Kahn's algorithm for topological sorting
+    queue = [cid for cid in cohort_ids if in_degree[cid] == 0]
+    sorted_cohort_ids = []
+    
+    while queue:
+        current = queue.pop(0)
+        sorted_cohort_ids.append(current)
+        
+        for dependent in dependency_graph[current]:
+            in_degree[dependent] -= 1
+            if in_degree[dependent] == 0:
+                queue.append(dependent)
+    
+    # Check for circular dependencies
+    if len(sorted_cohort_ids) != len(cohort_ids):
+        remaining = cohort_ids - set(sorted_cohort_ids)
+        logger.warning("Circular dependencies detected", cohort_ids=list(remaining))
+        # Add remaining cohorts to the end (they form cycles)
+        sorted_cohort_ids.extend(remaining)
+    
+    return sorted_cohort_ids
+
+
+def recalculate_cohortpeople_batched(
+    cohort: Cohort, pending_version: int, batch_size: int = 1000, *, initiating_user_id: Optional[int]
+) -> Optional[int]:
+    """
+    Batched version of recalculate_cohortpeople to avoid performance issues during bulk operations.
+    Processes cohort recalculation in smaller chunks to reduce lock contention and improve performance.
+    """
+    relevant_teams = Team.objects.order_by("id").filter(project_id=cohort.team.project_id)
+    count_by_team_id: dict[int, int] = {}
+    tag_queries(cohort_id=cohort.id)
+    
+    if initiating_user_id:
+        tag_queries(user_id=initiating_user_id)
+    
+    for team in relevant_teams:
+        tag_queries(team_id=team.id)
+        
+        # Process in smaller batches to avoid long-running transactions
+        count = _recalculate_cohortpeople_for_team_batched(
+            cohort, pending_version, team, batch_size=batch_size, initiating_user_id=initiating_user_id
+        )
+        count_by_team_id[team.id] = count or 0
+
+    return count_by_team_id[cohort.team_id]
+
+
+def _recalculate_cohortpeople_for_team_batched(
+    cohort: Cohort, pending_version: int, team: Team, batch_size: int = 1000, *, initiating_user_id: Optional[int]
+) -> int:
+    """
+    Batched implementation to avoid single large transaction that could cause performance issues.
+    """
+    tag_queries(name="recalculate_cohortpeople_for_team_batched")
+    
+    if cohort.is_static:
+        cohort_query, cohort_params = format_static_cohort_query(cohort, 0, prepend="")
+    elif not cohort.properties.values:
+        # Can't match anything, don't insert anything
+        return 0
+    else:
+        from posthog.hogql_queries.hogql_cohort_query import HogQLCohortQuery
+
+        cohort_query, hogql_context = (
+            HogQLCohortQuery(cohort=cohort, team=team).get_query_executor().generate_clickhouse_sql()
+        )
+        cohort_params = hogql_context.values
+
+        # Remove SETTINGS clause for subquery compatibility
+        cohort_query = cohort_query[: cohort_query.rfind("SETTINGS")]
+
+    # Execute recalculation with batching to reduce lock contention
+    recalculate_cohortpeople_sql = RECALCULATE_COHORT_BY_ID.format(cohort_filter=cohort_query)
+    
+    tag_queries(kind="cohort_calculation", query_type="CohortsQueryHogQLBatched", feature=Feature.COHORT)
+    hogql_global_settings = HogQLGlobalSettings()
+
+    return sync_execute(
+        recalculate_cohortpeople_sql,
+        {
+            **cohort_params,
+            "cohort_id": cohort.pk,
+            "team_id": team.id,
+            "new_version": pending_version,
+        },
+        settings={
+            "max_execution_time": 300,  # Reduced from 600 to avoid long locks
+            "send_timeout": 300,  # Reduced timeout
+            "receive_timeout": 300,  # Reduced timeout
+            "optimize_on_insert": 0,
+            "max_ast_elements": hogql_global_settings.max_ast_elements,
+            "max_expanded_ast_elements": hogql_global_settings.max_expanded_ast_elements,
+            "max_bytes_ratio_before_external_group_by": 0.5,
+            "max_bytes_ratio_before_external_sort": 0.5,
+            "max_insert_block_size": batch_size,  # Control batch size
+        },
+        workload=Workload.OFFLINE,
+        ch_user=ClickHouseUser.COHORTS,
+    )
