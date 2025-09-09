@@ -43,7 +43,6 @@ export function CyclotronJobTemplateSuggestions({
 
     // FUTURE IDEAS:
     // * Allow searching taxonomic properties to auto fill the data (events, person properties etc.)
-    // * Inline documentation for liquid
     // * Have the last selected text selection be passed in so we can fill it in the appropriate place
 
     return (
@@ -86,16 +85,36 @@ export function CyclotronJobTemplateSuggestions({
                 ))}
 
                 {templating === 'liquid' ? (
-                    <li>
-                        <LemonButton
-                            size="small"
-                            sideIcon={<IconExternal />}
-                            to="https://liquidjs.com/filters/overview.html"
-                            targetBlank
-                        >
-                            Liquid documentation
-                        </LemonButton>
-                    </li>
+                    <>
+                        <li>
+                            <LemonButton
+                                size="small"
+                                to="https://posthog.com/docs/cdp/destinations/customizing-destinations#liquid-templating"
+                            >
+                                PostHog Liquid Guide
+                            </LemonButton>
+                        </li>
+                        <li>
+                            <LemonButton
+                                size="small"
+                                sideIcon={<IconExternal />}
+                                to="https://github.com/PostHog/posthog/blob/master/posthog/cdp/templates/LIQUID_TEMPLATING.md"
+                                targetBlank
+                            >
+                                PostHog Liquid Reference
+                            </LemonButton>
+                        </li>
+                        <li>
+                            <LemonButton
+                                size="small"
+                                sideIcon={<IconExternal />}
+                                to="https://liquidjs.com/filters/overview.html"
+                                targetBlank
+                            >
+                                Liquid documentation
+                            </LemonButton>
+                        </li>
+                    </>
                 ) : null}
             </ul>
         </div>
