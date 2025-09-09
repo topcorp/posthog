@@ -98,6 +98,16 @@ export function CyclotronJobTemplateSuggestions({
                             <LemonButton
                                 size="small"
                                 sideIcon={<IconExternal />}
+                                to="https://github.com/PostHog/posthog/blob/master/posthog/cdp/templates/LIQUID_TEMPLATING.md"
+                                targetBlank
+                            >
+                                PostHog Liquid Reference
+                            </LemonButton>
+                        </li>
+                        <li>
+                            <LemonButton
+                                size="small"
+                                sideIcon={<IconExternal />}
                                 to="https://liquidjs.com/filters/overview.html"
                                 targetBlank
                             >
