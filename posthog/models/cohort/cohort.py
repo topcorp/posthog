@@ -276,6 +276,33 @@ class Cohort(FileSystemSyncMixin, RootTeamMixin, models.Model):
             "deleted": self.deleted,
         }
 
+    def save(self, *args, **kwargs):
+        # Track if this is a new cohort or if filters changed
+        is_new = self.pk is None
+        filters_changed = False
+        
+        if not is_new:
+            try:
+                old_instance = Cohort.objects.get(pk=self.pk)
+                filters_changed = (
+                    old_instance.filters != self.filters or 
+                    old_instance.groups != self.groups
+                )
+            except Cohort.DoesNotExist:
+                is_new = True
+        
+        # Save the cohort first
+        super().save(*args, **kwargs)
+        
+        # Update dependencies if needed (for new cohorts or when filters change)
+        if (is_new or filters_changed) and not getattr(self, '_skip_dependency_update', False):
+            try:
+                from posthog.models.cohort.util import update_cohort_dependencies_batched
+                update_cohort_dependencies_batched(self, batch_size=50)
+            except Exception as e:
+                logger.warning("failed_to_update_cohort_dependencies", cohort_id=self.pk, error=str(e))
+                # Don't fail the save operation if dependency update fails
+
     def calculate_people_ch(self, pending_version: int, *, initiating_user_id: Optional[int] = None):
         from posthog.models.cohort.util import recalculate_cohortpeople
 
@@ -518,6 +545,33 @@ class Cohort(FileSystemSyncMixin, RootTeamMixin, models.Model):
         return {k: v for k, v in base_dict.items() if k not in excluded_fields}
 
     __repr__ = sane_repr("id", "name", "last_calculation")
+
+
+class CohortDependency(models.Model):
+    """
+    Tracks dependencies between cohorts to optimize calculation ordering and prevent circular dependencies.
+    This model helps avoid the performance issues of calculating dependencies on-the-fly during bulk operations.
+    """
+    cohort = models.ForeignKey("Cohort", on_delete=models.CASCADE, related_name="depends_on")
+    depends_on = models.ForeignKey("Cohort", on_delete=models.CASCADE, related_name="dependents")
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["cohort_id"]),
+            models.Index(fields=["depends_on_id"]),
+            models.Index(fields=["cohort_id", "depends_on_id"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["cohort_id", "depends_on_id"], 
+                name="unique_cohort_dependency"
+            ),
+            models.CheckConstraint(
+                check=~models.Q(cohort=models.F("depends_on")),
+                name="no_self_dependency"
+            ),
+        ]
 
 
 class CohortPeople(models.Model):
