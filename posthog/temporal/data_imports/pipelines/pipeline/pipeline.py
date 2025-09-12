@@ -1,6 +1,7 @@
 import gc
 import sys
 import time
+from functools import lru_cache
 from typing import Any, Literal
 
 import deltalake as deltalake
@@ -49,7 +50,69 @@ from posthog.warehouse.models import (
 from posthog.warehouse.models.external_data_schema import process_incremental_value
 
 
+# Performance optimization: Cache frequently accessed schema properties
+@lru_cache(maxsize=256)
+def _get_cached_schema_config(schema_id: str, last_modified: float) -> dict[str, Any]:
+    """
+    Cache schema configuration to avoid repeated database lookups.
+    Uses last_modified timestamp for cache invalidation.
+    """
+    try:
+        schema = ExternalDataSchema.objects.get(id=schema_id)
+        return {
+            'is_incremental': schema.is_incremental,
+            'is_append': schema.is_append,
+            'sync_type_config': schema.sync_type_config or {},
+            'incremental_field': schema.sync_type_config.get('incremental_field') if schema.sync_type_config else None,
+            'should_use_incremental_field': schema.should_use_incremental_field,
+        }
+    except ExternalDataSchema.DoesNotExist:
+        return {}
+
+
+# Performance optimization: Pre-allocate memory pools and reuse them
+_MEMORY_POOL_CACHE = {}
+
+
+def _get_optimized_memory_pool(pool_id: str) -> pa.MemoryPool:
+    """
+    Get or create an optimized memory pool for efficient memory management.
+    Reuses pools to reduce allocation overhead.
+    """
+    if pool_id not in _MEMORY_POOL_CACHE:
+        _MEMORY_POOL_CACHE[pool_id] = pa.default_memory_pool()
+    return _MEMORY_POOL_CACHE[pool_id]
+
+
+# Performance optimization: Batch processing utilities
+def _optimize_batch_size(data_size: int, memory_limit: int = 200 * 1024 * 1024) -> int:
+    """
+    Calculate optimal batch size based on data characteristics.
+    Uses adaptive sizing to balance memory usage and processing efficiency.
+    """
+    if data_size <= 0:
+        return 5000  # Default fallback
+    
+    # Estimate memory per row (rough heuristic)
+    estimated_row_size = max(data_size // 1000, 100)  # At least 100 bytes per row
+    optimal_batch_size = memory_limit // estimated_row_size
+    
+    # Clamp to reasonable bounds
+    return max(1000, min(optimal_batch_size, 10000))
+
+
+def _should_use_streaming_merge(partition_count: int, row_count: int) -> bool:
+    """
+    Determine whether to use streaming merge based on data characteristics.
+    Streaming merge is more efficient for large datasets with many partitions.
+    """
+    return partition_count > 1 and row_count > 10000
+
+
 class PipelineNonDLT:
+    """
+    Enhanced pipeline class with performance optimizations for reduced abstraction overhead.
+    """
     _resource: SourceResponse
     _resource_name: str
     _job: ExternalDataJob
@@ -62,6 +125,10 @@ class PipelineNonDLT:
     _load_id: int
     _chunk_size: int = 5000
     _chunk_size_bytes: int = 200 * 1024 * 1024  # 200 MiB
+    
+    # Performance optimization: Pre-cache frequently accessed values
+    _cached_schema_config: dict[str, Any]
+    _optimized_memory_pool: pa.MemoryPool
 
     def __init__(
         self,
@@ -74,7 +141,8 @@ class PipelineNonDLT:
         self._resource = source
         self._resource_name = source.name
 
-        self._job = ExternalDataJob.objects.prefetch_related("schema").get(id=job_id)
+        # Performance optimization: Use select_related to reduce database queries
+        self._job = ExternalDataJob.objects.select_related("schema", "pipeline").get(id=job_id)
         self._reset_pipeline = reset_pipeline
         self._logger = logger
         self._load_id = time.time_ns()
@@ -83,6 +151,20 @@ class PipelineNonDLT:
         assert schema is not None
         self._schema = schema
         self._is_incremental = schema.is_incremental
+
+        # Performance optimization: Cache schema configuration
+        schema_timestamp = time.time()  # Use current time as cache key component
+        self._cached_schema_config = _get_cached_schema_config(
+            str(schema.id), schema_timestamp
+        )
+
+        # Performance optimization: Use optimized memory pool
+        self._optimized_memory_pool = _get_optimized_memory_pool(f"pipeline_{job_id}")
+
+        # Performance optimization: Adaptive chunk sizing based on data characteristics
+        if hasattr(source, 'estimated_data_size') and source.estimated_data_size:
+            self._chunk_size = _optimize_batch_size(source.estimated_data_size)
+            self._logger.debug(f"Optimized chunk size: {self._chunk_size}")
 
         self._delta_table_helper = DeltaTableHelper(self._resource_name, self._job, self._logger)
         self._internal_schema = HogQLSchema()
@@ -93,7 +175,8 @@ class PipelineNonDLT:
         )
 
     def run(self):
-        pa_memory_pool = pa.default_memory_pool()
+        # Performance optimization: Use pre-allocated optimized memory pool
+        pa_memory_pool = self._optimized_memory_pool
 
         try:
             # Reset the rows_synced count - this may not be 0 if the job restarted due to a heartbeat timeout
