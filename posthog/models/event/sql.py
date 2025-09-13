@@ -454,6 +454,7 @@ WHERE
     {value_filter}
 {order_by_clause}
 LIMIT 10
+SETTINGS max_execution_time = 15, max_memory_usage = 500000000, max_bytes_before_external_group_by = 200000000, max_rows_to_read = 10000000, timeout_before_checking_execution_speed = 5
 """
 
 SELECT_EVENT_BY_TEAM_AND_CONDITIONS_SQL = """

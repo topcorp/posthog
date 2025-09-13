@@ -504,11 +504,12 @@ FROM (
         {property_field} IS NOT NULL AND
         {property_field} != ''
     ORDER BY id DESC
-    LIMIT 100000
+    LIMIT 50000
 )
 GROUP BY value
 ORDER BY count(value) DESC
 LIMIT 20
+SETTINGS max_execution_time = 15, max_memory_usage = 300000000, max_bytes_before_external_group_by = 100000000, max_rows_to_read = 5000000, timeout_before_checking_execution_speed = 3
 """
 
 SELECT_PERSON_PROP_VALUES_SQL_WITH_FILTER = """
@@ -525,11 +526,12 @@ FROM (
         is_deleted = 0 AND
         {property_field} ILIKE %(value)s
     ORDER BY id DESC
-    LIMIT 100000
+    LIMIT 50000
 )
 GROUP BY value
 ORDER BY count(value) DESC
 LIMIT 20
+SETTINGS max_execution_time = 15, max_memory_usage = 300000000, max_bytes_before_external_group_by = 100000000, max_rows_to_read = 5000000, timeout_before_checking_execution_speed = 3
 """
 
 GET_PERSON_COUNT_FOR_TEAM = "SELECT count() AS count FROM person WHERE team_id = %(team_id)s"
