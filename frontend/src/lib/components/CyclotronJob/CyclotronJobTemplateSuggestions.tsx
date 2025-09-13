@@ -73,9 +73,15 @@ export function CyclotronJobTemplateSuggestions({
                 </div>
                 <div className="text-xs text-secondary">
                     Below are a list of available functions for templating your inputs using <b>{templating}</b>.{' '}
-                    <Link to="https://posthog.com/docs/cdp/destinations/customizing-destinations#customizing-payload">
-                        Learn more
-                    </Link>
+                    {templating === 'liquid' ? (
+                        <Link to="https://liquidjs.com/tutorials/intro-to-liquid.html" targetBlank>
+                            Liquid syntax guide
+                        </Link>
+                    ) : (
+                        <Link to="https://posthog.com/docs/cdp/destinations/customizing-destinations#customizing-payload">
+                            Learn more
+                        </Link>
+                    )}
                 </div>
             </div>
             <ul className="flex overflow-y-auto flex-col flex-1 gap-px p-2 border-t max-w-100">
@@ -86,16 +92,38 @@ export function CyclotronJobTemplateSuggestions({
                 ))}
 
                 {templating === 'liquid' ? (
-                    <li>
-                        <LemonButton
-                            size="small"
-                            sideIcon={<IconExternal />}
-                            to="https://liquidjs.com/filters/overview.html"
-                            targetBlank
-                        >
-                            Liquid documentation
-                        </LemonButton>
-                    </li>
+                    <>
+                        <li>
+                            <LemonButton
+                                size="small"
+                                sideIcon={<IconExternal />}
+                                to="https://liquidjs.com/tutorials/intro-to-liquid.html"
+                                targetBlank
+                            >
+                                Liquid syntax guide
+                            </LemonButton>
+                        </li>
+                        <li>
+                            <LemonButton
+                                size="small"
+                                sideIcon={<IconExternal />}
+                                to="https://liquidjs.com/filters/overview.html"
+                                targetBlank
+                            >
+                                Liquid filters reference
+                            </LemonButton>
+                        </li>
+                        <li>
+                            <LemonButton
+                                size="small"
+                                sideIcon={<IconExternal />}
+                                to="https://liquidjs.com/tags/overview.html"
+                                targetBlank
+                            >
+                                Liquid tags reference
+                            </LemonButton>
+                        </li>
+                    </>
                 ) : null}
             </ul>
         </div>

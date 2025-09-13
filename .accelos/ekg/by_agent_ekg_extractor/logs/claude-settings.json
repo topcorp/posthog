@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/Users/sidchoudhury/accelos/a0/ekg/src/agentic/claude_code/capture_transcript.sh /Users/sidchoudhury/topcorp/posthog/.accelos/ekg/by_agent_ekg_extractor/logs/claude-session.json"
+          }
+        ]
+      }
+    ]
+  }
+}
