@@ -4,6 +4,7 @@ import datetime as dt
 import json
 import posixpath
 import typing
+import time
 
 import aioboto3
 import botocore.exceptions
@@ -21,6 +22,7 @@ if typing.TYPE_CHECKING:
 from django.conf import settings
 from temporalio import activity, workflow
 from temporalio.common import RetryPolicy
+from posthog.exceptions_capture import capture_exception
 
 from posthog.batch_exports.service import (
     BatchExportField,
@@ -227,19 +229,69 @@ class InvalidS3EndpointError(Exception):
 
 
 async def upload_manifest_file(inputs: S3InsertInputs, files_uploaded: list[str], manifest_key: str):
-    session = aioboto3.Session()
-    async with session.client(
-        "s3",
-        region_name=inputs.region,
-        aws_access_key_id=inputs.aws_access_key_id,
-        aws_secret_access_key=inputs.aws_secret_access_key,
-        endpoint_url=inputs.endpoint_url,
-    ) as client:
-        await client.put_object(
-            Bucket=inputs.bucket_name,
-            Key=manifest_key,
-            Body=json.dumps({"files": files_uploaded}),
+    start_time = time.time()
+    manifest_data = json.dumps({"files": files_uploaded})
+    content_size = len(manifest_data.encode('utf-8'))
+    
+    try:
+        session = aioboto3.Session()
+        async with session.client(
+            "s3",
+            region_name=inputs.region,
+            aws_access_key_id=inputs.aws_access_key_id,
+            aws_secret_access_key=inputs.aws_secret_access_key,
+            endpoint_url=inputs.endpoint_url,
+        ) as client:
+            await client.put_object(
+                Bucket=inputs.bucket_name,
+                Key=manifest_key,
+                Body=manifest_data,
+            )
+            
+        # Log successful upload
+        upload_duration = (time.time() - start_time) * 1000  # Convert to milliseconds
+        LOGGER.debug(
+            "s3_batch_export_manifest_upload_success",
+            bucket=inputs.bucket_name,
+            manifest_key=manifest_key,
+            files_count=len(files_uploaded),
+            content_size=content_size,
+            upload_duration_ms=upload_duration,
         )
+    except Exception as e:
+        # Log detailed error information
+        upload_duration = (time.time() - start_time) * 1000
+        error_code = getattr(e, 'response', {}).get('Error', {}).get('Code', 'unknown') if hasattr(e, 'response') else type(e).__name__
+        http_status = getattr(e, 'response', {}).get('ResponseMetadata', {}).get('HTTPStatusCode', 0) if hasattr(e, 'response') else 0
+        request_id = getattr(e, 'response', {}).get('ResponseMetadata', {}).get('RequestId', 'unknown') if hasattr(e, 'response') else 'unknown'
+        
+        LOGGER.error(
+            "s3_batch_export_manifest_upload_failed",
+            bucket=inputs.bucket_name,
+            manifest_key=manifest_key,
+            files_count=len(files_uploaded),
+            content_size=content_size,
+            upload_duration_ms=upload_duration,
+            error_type=type(e).__name__,
+            error=str(e),
+            aws_error_code=error_code,
+            http_status_code=http_status,
+            request_id=request_id,
+            endpoint_url=inputs.endpoint_url,
+        )
+        
+        capture_exception(e, extra_data={
+            "operation": "s3_batch_export_manifest_upload",
+            "bucket": inputs.bucket_name,
+            "manifest_key": manifest_key,
+            "files_count": len(files_uploaded),
+            "error_type": type(e).__name__,
+            "aws_error_code": error_code,
+            "http_status_code": http_status,
+            "request_id": request_id,
+            "upload_duration_ms": upload_duration
+        })
+        raise
 
 
 def s3_default_fields() -> list[BatchExportField]:
@@ -780,25 +832,111 @@ class ConcurrentS3Consumer(Consumer):
         if not self.upload_id:
             raise NoUploadInProgressError()
 
-        # Sort parts by part number
-        sorted_parts = [self.completed_parts[part_num] for part_num in sorted(self.completed_parts.keys())]
-
+        start_time = time.time()
         current_key = self._get_current_key()
-        client = await self._get_s3_client()
-        await client.complete_multipart_upload(
-            Bucket=self.s3_inputs.bucket_name,
-            Key=current_key,
-            UploadId=self.upload_id,
-            MultipartUpload={"Parts": sorted_parts},
-        )
+        parts_count = len(self.completed_parts)
+        
+        try:
+            # Sort parts by part number
+            sorted_parts = [self.completed_parts[part_num] for part_num in sorted(self.completed_parts.keys())]
+            client = await self._get_s3_client()
+            
+            await client.complete_multipart_upload(
+                Bucket=self.s3_inputs.bucket_name,
+                Key=current_key,
+                UploadId=self.upload_id,
+                MultipartUpload={"Parts": sorted_parts},
+            )
+            
+            # Log successful completion
+            completion_duration = (time.time() - start_time) * 1000
+            self.logger.debug(
+                "s3_batch_export_multipart_completion_success",
+                file_number=self.current_file_index,
+                bucket=self.s3_inputs.bucket_name,
+                key=current_key,
+                upload_id=self.upload_id,
+                parts_count=parts_count,
+                completion_duration_ms=completion_duration,
+                total_file_size=self.current_file_size,
+            )
+            
+        except Exception as e:
+            completion_duration = (time.time() - start_time) * 1000
+            error_code = getattr(e, 'response', {}).get('Error', {}).get('Code', 'unknown') if hasattr(e, 'response') else type(e).__name__
+            http_status = getattr(e, 'response', {}).get('ResponseMetadata', {}).get('HTTPStatusCode', 0) if hasattr(e, 'response') else 0
+            request_id = getattr(e, 'response', {}).get('ResponseMetadata', {}).get('RequestId', 'unknown') if hasattr(e, 'response') else 'unknown'
+            
+            self.logger.error(
+                "s3_batch_export_multipart_completion_failed",
+                file_number=self.current_file_index,
+                bucket=self.s3_inputs.bucket_name,
+                key=current_key,
+                upload_id=self.upload_id,
+                parts_count=parts_count,
+                completion_duration_ms=completion_duration,
+                error_type=type(e).__name__,
+                error=str(e),
+                aws_error_code=error_code,
+                http_status_code=http_status,
+                request_id=request_id,
+                total_file_size=self.current_file_size,
+            )
+            
+            capture_exception(e, extra_data={
+                "operation": "s3_batch_export_multipart_completion",
+                "file_number": self.current_file_index,
+                "bucket": self.s3_inputs.bucket_name,
+                "key": current_key,
+                "upload_id": self.upload_id,
+                "parts_count": parts_count,
+                "error_type": type(e).__name__,
+                "aws_error_code": error_code,
+                "http_status_code": http_status,
+                "request_id": request_id,
+                "completion_duration_ms": completion_duration
+            })
+            raise
 
     async def _abort(self):
         """Abort this S3 multi-part upload."""
         if self.upload_id:
+            start_time = time.time()
+            current_key = self._get_current_key()
+            upload_id = self.upload_id
+            
             try:
                 client = await self._get_s3_client()
                 await client.abort_multipart_upload(
-                    Bucket=self.s3_inputs.bucket_name, Key=self._get_current_key(), UploadId=self.upload_id
+                    Bucket=self.s3_inputs.bucket_name, Key=current_key, UploadId=upload_id
                 )
-            except Exception:
-                pass  # Best effort cleanup
+                
+                # Log successful abort
+                abort_duration = (time.time() - start_time) * 1000
+                self.logger.debug(
+                    "s3_batch_export_multipart_abort_success",
+                    file_number=self.current_file_index,
+                    bucket=self.s3_inputs.bucket_name,
+                    key=current_key,
+                    upload_id=upload_id,
+                    abort_duration_ms=abort_duration,
+                )
+                
+            except Exception as e:
+                # Log abort failures for monitoring, but don't raise since this is best-effort cleanup
+                abort_duration = (time.time() - start_time) * 1000
+                error_code = getattr(e, 'response', {}).get('Error', {}).get('Code', 'unknown') if hasattr(e, 'response') else type(e).__name__
+                
+                self.logger.warning(
+                    "s3_batch_export_multipart_abort_failed",
+                    file_number=self.current_file_index,
+                    bucket=self.s3_inputs.bucket_name,
+                    key=current_key,
+                    upload_id=upload_id,
+                    abort_duration_ms=abort_duration,
+                    error_type=type(e).__name__,
+                    error=str(e),
+                    aws_error_code=error_code,
+                )
+                
+                # Don't capture exception for abort failures as they're expected during cleanup

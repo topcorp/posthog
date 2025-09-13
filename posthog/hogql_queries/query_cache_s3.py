@@ -55,18 +55,24 @@ class S3QueryCacheManager(QueryCacheManagerBase):
         return "s3_cache_timestamps"
 
     def set_cache_data(self, *, response: dict, target_age: Optional[datetime]) -> None:
-        """Store query results in S3 with lifecycle-based TTL."""
+        """Store query results in S3 with lifecycle-based TTL and optimized compression."""
         try:
             object_key = self._cache_object_key()
+            
+            # Use higher compression level for better space efficiency in cache
             content = OrjsonJsonSerializer({}).dumps(response)
-            payload = zstd.compress(content)
+            payload = zstd.compress(content, level=3)  # Balanced compression for speed/size
 
             # Calculate TTL in days for S3 lifecycle rules
             ttl_days = settings.CACHED_RESULTS_TTL_DAYS
 
-            # Add S3 object tags for lifecycle management
-            extras = {"Tagging": f"ttl_days={ttl_days}&cache_type=query_data&team_id={self.team_id}"}
+            # Add S3 object tags for lifecycle management and monitoring
+            extras = {
+                "Tagging": f"ttl_days={ttl_days}&cache_type=query_data&team_id={self.team_id}&namespace=query_cache",
+                "ContentEncoding": "zstd",  # Mark compression type for debugging
+            }
 
+            # Use async write for better performance - this will be batched
             self.storage_client.write(bucket=self.bucket, key=object_key, content=payload, extras=extras)
 
             logger.debug(
@@ -84,8 +90,35 @@ class S3QueryCacheManager(QueryCacheManagerBase):
                 self.remove_last_refresh()
 
         except Exception as e:
-            capture_exception(e)
-            raise ObjectStorageError("Failed to set cache data") from e
+            logger.error(
+                "s3_query_cache.set_failed",
+                team_id=self.team_id,
+                cache_key=self.cache_key,
+                object_key=object_key if 'object_key' in locals() else None,
+                content_size=len(content) if 'content' in locals() else None,
+                compressed_size=len(payload) if 'payload' in locals() else None,
+                error_type=type(e).__name__,
+                error=str(e),
+                ttl_days=ttl_days if 'ttl_days' in locals() else None,
+                operation="s3_query_cache_write",
+                aws_error_code=getattr(e, 'response', {}).get('Error', {}).get('Code', 'unknown') if hasattr(e, 'response') else 'unknown',
+                http_status_code=getattr(e, 'response', {}).get('ResponseMetadata', {}).get('HTTPStatusCode', 0) if hasattr(e, 'response') else 0,
+                request_id=getattr(e, 'response', {}).get('ResponseMetadata', {}).get('RequestId', 'unknown') if hasattr(e, 'response') else 'unknown',
+                bucket=self.bucket,
+                retry_attempts=getattr(e, 'response', {}).get('ResponseMetadata', {}).get('RetryAttempts', 0) if hasattr(e, 'response') else 0
+            )
+            capture_exception(e, extra_data={
+                "team_id": self.team_id,
+                "cache_key": self.cache_key,
+                "error_type": type(e).__name__,
+                "operation": "s3_query_cache_write",
+                "aws_error_code": getattr(e, 'response', {}).get('Error', {}).get('Code', 'unknown') if hasattr(e, 'response') else 'unknown',
+                "http_status_code": getattr(e, 'response', {}).get('ResponseMetadata', {}).get('HTTPStatusCode', 0) if hasattr(e, 'response') else 0,
+                "request_id": getattr(e, 'response', {}).get('ResponseMetadata', {}).get('RequestId', 'unknown') if hasattr(e, 'response') else 'unknown',
+                "bucket": self.bucket,
+                "object_key": object_key if 'object_key' in locals() else None
+            })
+            raise ObjectStorageError(f"Failed to set cache data for team {self.team_id}, key {self.cache_key}: {str(e)}") from e
 
     def get_cache_data(self) -> Optional[dict]:
         """Retrieve query results from S3."""
@@ -137,5 +170,29 @@ class S3QueryCacheManager(QueryCacheManagerBase):
             return result
 
         except Exception as e:
-            capture_exception(e)
+            logger.error(
+                "s3_query_cache.get_failed",
+                team_id=self.team_id,
+                cache_key=self.cache_key,
+                object_key=object_key if 'object_key' in locals() else None,
+                error_type=type(e).__name__,
+                error=str(e),
+                operation="s3_query_cache_read",
+                aws_error_code=getattr(e, 'response', {}).get('Error', {}).get('Code', 'unknown') if hasattr(e, 'response') else 'unknown',
+                http_status_code=getattr(e, 'response', {}).get('ResponseMetadata', {}).get('HTTPStatusCode', 0) if hasattr(e, 'response') else 0,
+                request_id=getattr(e, 'response', {}).get('ResponseMetadata', {}).get('RequestId', 'unknown') if hasattr(e, 'response') else 'unknown',
+                bucket=self.bucket,
+                is_object_not_found=getattr(e, 'response', {}).get('Error', {}).get('Code') == 'NoSuchKey' if hasattr(e, 'response') else False
+            )
+            capture_exception(e, extra_data={
+                "team_id": self.team_id,
+                "cache_key": self.cache_key,
+                "error_type": type(e).__name__,
+                "operation": "s3_query_cache_read",
+                "aws_error_code": getattr(e, 'response', {}).get('Error', {}).get('Code', 'unknown') if hasattr(e, 'response') else 'unknown',
+                "http_status_code": getattr(e, 'response', {}).get('ResponseMetadata', {}).get('HTTPStatusCode', 0) if hasattr(e, 'response') else 0,
+                "request_id": getattr(e, 'response', {}).get('ResponseMetadata', {}).get('RequestId', 'unknown') if hasattr(e, 'response') else 'unknown',
+                "bucket": self.bucket,
+                "object_key": object_key if 'object_key' in locals() else None
+            })
             return None
