@@ -470,8 +470,112 @@ def property_to_expr(
         else:
             chain = ["properties"]
 
+        # Handle URL-based properties in session replay scope by using the all_urls array column
+        # instead of joining with the events table
+        if (property.type == "event"
+            and scope == "replay"
+            and property.key in ["$current_url", "$pathname", "$host"]):
+            # Use the all_urls array column directly for URL properties to avoid events table join
+            field = ast.Field(chain=["all_urls"])
+            # Convert the array-based lookup into a proper expression that checks if the value
+            # exists in the all_urls array
+            expr: ast.Expr = field
+
+            # Apply operator-specific logic for array lookup
+            if operator == PropertyOperator.EXACT:
+                expr = ast.Call(name="has", args=[field, ast.Constant(value=value)])
+            elif operator == PropertyOperator.IS_NOT:
+                expr = ast.Call(name="NOT", args=[ast.Call(name="has", args=[field, ast.Constant(value=value)])])
+            elif operator == PropertyOperator.ICONTAINS:
+                # For contains, we need to check if any URL in the array contains the value
+                expr = ast.Call(
+                    name="arrayExists",
+                    args=[
+                        ast.Lambda(
+                            args=["url"],
+                            expr=ast.Call(
+                                name="position",
+                                args=[
+                                    ast.Field(chain=["url"]),
+                                    ast.Constant(value=str(value).lower())
+                                ]
+                            )
+                        ),
+                        field
+                    ]
+                )
+            elif operator == PropertyOperator.NOT_ICONTAINS:
+                # For not contains, negate the contains check
+                expr = ast.Call(
+                    name="NOT",
+                    args=[
+                        ast.Call(
+                            name="arrayExists",
+                            args=[
+                                ast.Lambda(
+                                    args=["url"],
+                                    expr=ast.Call(
+                                        name="position",
+                                        args=[
+                                            ast.Field(chain=["url"]),
+                                            ast.Constant(value=str(value).lower())
+                                        ]
+                                    )
+                                ),
+                                field
+                            ]
+                        )
+                    ]
+                )
+            elif operator == PropertyOperator.REGEX:
+                # For regex, check if any URL matches the pattern
+                expr = ast.Call(
+                    name="arrayExists",
+                    args=[
+                        ast.Lambda(
+                            args=["url"],
+                            expr=ast.Call(
+                                name="match",
+                                args=[
+                                    ast.Field(chain=["url"]),
+                                    ast.Constant(value=str(value))
+                                ]
+                            )
+                        ),
+                        field
+                    ]
+                )
+            elif operator == PropertyOperator.NOT_REGEX:
+                # For not regex, negate the regex check
+                expr = ast.Call(
+                    name="NOT",
+                    args=[
+                        ast.Call(
+                            name="arrayExists",
+                            args=[
+                                ast.Lambda(
+                                    args=["url"],
+                                    expr=ast.Call(
+                                        name="match",
+                                        args=[
+                                            ast.Field(chain=["url"]),
+                                            ast.Constant(value=str(value))
+                                        ]
+                                    )
+                                ),
+                                field
+                            ]
+                        )
+                    ]
+                )
+            else:
+                # For other operators, fall back to has() check
+                expr = ast.Call(name="has", args=[field, ast.Constant(value=value)])
+
+            # Return early for URL properties to avoid the default processing
+            return expr
         # We pretend elements chain is a property, but it is actually a column on the events table
-        if chain == ["properties"] and property.key == "$elements_chain":
+        elif chain == ["properties"] and property.key == "$elements_chain":
             field = ast.Field(chain=["elements_chain"])
         else:
             field = ast.Field(chain=[*chain, property.key])
