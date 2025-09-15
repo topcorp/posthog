@@ -20,7 +20,15 @@ from posthog.exceptions_capture import capture_exception
 from posthog.api.monitoring import Feature
 from posthog.models import Cohort
 from posthog.models.cohort import CohortOrEmpty
-from posthog.models.cohort.util import get_static_cohort_size, get_dependent_cohorts, sort_cohorts_topologically
+from posthog.models.cohort.util import (
+    get_static_cohort_size, 
+    get_dependent_cohorts, 
+    get_dependent_cohorts_optimized,
+    sort_cohorts_topologically,
+    sort_cohorts_topologically_optimized,
+    update_cohort_dependencies_batched,
+    recalculate_cohortpeople_batched,
+)
 from posthog.models.user import User
 from posthog.tasks.utils import CeleryQueue
 
@@ -186,19 +194,30 @@ def enqueue_cohorts_to_calculate(parallel_count: int) -> None:
 
 
 def increment_version_and_enqueue_calculate_cohort(cohort: Cohort, *, initiating_user: Optional[User]) -> None:
-    dependent_cohorts = get_dependent_cohorts(cohort)
+    # First ensure dependency tracking is up to date
+    try:
+        update_cohort_dependencies_batched(cohort, batch_size=50)
+    except Exception as e:
+        logger.warning("cohort_dependency_update_failed", cohort_id=cohort.id, error=str(e))
+        # Continue with fallback behavior
+    
+    # Use optimized dependency detection to avoid performance issues during bulk operations
+    try:
+        dependent_cohorts = get_dependent_cohorts_optimized(cohort)
+    except Exception as e:
+        logger.warning("optimized_dependency_detection_failed", cohort_id=cohort.id, error=str(e))
+        # Fallback to original method
+        dependent_cohorts = get_dependent_cohorts(cohort)
+    
     if dependent_cohorts:
         logger.info("cohort_has_dependencies", cohort_id=cohort.id, dependent_count=len(dependent_cohorts))
 
         all_cohort_ids = {dep.id for dep in dependent_cohorts}
         all_cohort_ids.add(cohort.id)
 
-        # Sort cohorts (dependencies first)
-        seen_cohorts_cache: dict[int, CohortOrEmpty] = {dep.id: dep for dep in dependent_cohorts}
-        seen_cohorts_cache[cohort.id] = cohort
-
         try:
-            sorted_cohort_ids = sort_cohorts_topologically(all_cohort_ids, seen_cohorts_cache)
+            # Use optimized topological sorting to improve performance during bulk operations
+            sorted_cohort_ids = sort_cohorts_topologically_optimized(all_cohort_ids)
         except Exception as e:
             COHORT_DEPENDENCY_CALCULATION_FAILURES_COUNTER.inc()
             logger.exception("cohort_dependency_resolution_failed", cohort_id=cohort.id, error=str(e))
@@ -210,12 +229,15 @@ def increment_version_and_enqueue_calculate_cohort(cohort: Cohort, *, initiating
 
         # Create a chain of tasks to ensure sequential execution
         task_chain = []
+        cohort_cache = {dep.id: dep for dep in dependent_cohorts}
+        cohort_cache[cohort.id] = cohort
+        
         for cohort_id in sorted_cohort_ids:
-            current_cohort = seen_cohorts_cache.get(cohort_id)
+            current_cohort = cohort_cache.get(cohort_id)
             if current_cohort and not current_cohort.is_static:
                 _prepare_cohort_for_calculation(current_cohort)
                 task_chain.append(
-                    calculate_cohort_ch.si(
+                    calculate_cohort_ch_batched.si(
                         current_cohort.id,
                         current_cohort.pending_version,
                         initiating_user.id if initiating_user else None,
@@ -272,6 +294,60 @@ def calculate_cohort_ch(cohort_id: int, pending_version: int, initiating_user_id
         update_tags(tags)
 
         cohort.calculate_people_ch(pending_version, initiating_user_id=initiating_user_id)
+
+
+@shared_task(ignore_result=True, max_retries=2, queue=CeleryQueue.LONG_RUNNING.value)
+def calculate_cohort_ch_batched(cohort_id: int, pending_version: int, initiating_user_id: Optional[int] = None) -> None:
+    """
+    Batched version of cohort calculation that processes in smaller chunks to avoid performance issues
+    during bulk operations. This addresses the issue of database triggers impacting performance.
+    """
+    with posthoganalytics.new_context():
+        posthoganalytics.tag("feature", Feature.COHORT.value)
+        posthoganalytics.tag("cohort_id", cohort_id)
+
+        cohort: Cohort = Cohort.objects.get(pk=cohort_id)
+
+        posthoganalytics.tag("team_id", cohort.team.id)
+
+        staleness_hours = 0.0
+        if cohort.last_calculation is not None:
+            staleness_hours = (timezone.now() - cohort.last_calculation).total_seconds() / 3600
+        COHORT_STALENESS_HOURS_GAUGE.set(staleness_hours)
+
+        tags = QueryTags(cohort_id=cohort_id, feature=query_tagging.Feature.COHORT)
+        if initiating_user_id:
+            tags.user_id = initiating_user_id
+        if current_task and current_task.request and current_task.request.id:
+            tags.celery_task_id = current_task.request.id
+        update_tags(tags)
+
+        # Use batched recalculation to improve performance during bulk operations
+        try:
+            count = recalculate_cohortpeople_batched(cohort, pending_version, initiating_user_id=initiating_user_id)
+            cohort.count = count
+            cohort.last_calculation = timezone.now()
+            cohort.errors_calculating = 0
+            cohort.last_error_at = None
+        except Exception:
+            cohort.errors_calculating = F("errors_calculating") + 1
+            cohort.last_error_at = timezone.now()
+            logger.warning(
+                "cohort_calculation_failed_batched",
+                id=cohort_id,
+                current_version=cohort.version,
+                new_version=pending_version,
+                exc_info=True,
+            )
+            raise
+        finally:
+            cohort.is_calculating = False
+            cohort.save()
+
+        # Update filter to match pending version if still valid
+        Cohort.objects.filter(pk=cohort_id).filter(Q(version__lt=pending_version) | Q(version__isnull=True)).update(
+            version=pending_version, count=count
+        )
 
 
 @shared_task(ignore_result=True, max_retries=1)

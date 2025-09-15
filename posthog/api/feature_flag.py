@@ -1697,7 +1697,15 @@ def handle_feature_flag_change(sender, scope, before_update, after_update, activ
 @receiver(post_save, sender=Cohort)
 @receiver(post_delete, sender=Cohort)
 def handle_cohort_change(sender, instance, **kwargs):
-    """Invalidate flag definitions cache when cohorts change."""
+    """
+    Invalidate flag definitions cache when cohorts change.
+    During bulk operations, this skips cache invalidation to avoid performance issues.
+    """
+    # Skip cache invalidation during bulk operations to avoid performance issues
+    # This is set by migration or bulk operations
+    if getattr(instance, '_skip_signals', False):
+        return
+        
     invalidate_cache_for_cohort_change(instance)
 
 

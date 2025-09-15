@@ -1,6 +1,6 @@
 from collections.abc import Sequence
 import json
-from conditional_cache import lru_cache
+from functools import lru_cache
 from typing import Any, Literal
 import deltalake.exceptions
 import pyarrow as pa
@@ -83,7 +83,7 @@ class DeltaTableHelper:
 
         return delta_table
 
-    @lru_cache(maxsize=1, condition=lambda result: result is not None)
+    @lru_cache(maxsize=1)
     def get_delta_table(self) -> deltalake.DeltaTable | None:
         delta_uri = self._get_delta_table_uri()
         storage_options = self._get_credentials()
@@ -153,8 +153,12 @@ class DeltaTableHelper:
 
                 # Group the table by the partition key and merge multiple times with streamed_exec=True for optimised merging
                 unique_partitions = pc.unique(data[PARTITION_KEY])  # type: ignore
+                partition_count = len(unique_partitions)
+                
+                self._logger.debug(f"Running {partition_count} optimised merges")
 
-                self._logger.debug(f"Running {len(unique_partitions)} optimised merges")
+                # Performance optimization: Use adaptive streaming based on data size
+                use_streaming = partition_count > 1 and data.num_rows > 10000
 
                 for partition in unique_partitions:
                     partition_predicate_ops = predicate_ops.copy()
@@ -163,7 +167,7 @@ class DeltaTableHelper:
 
                     filtered_table = data.filter(pc.equal(data[PARTITION_KEY], partition))
 
-                    self._logger.debug(f"Merging partition={partition} with predicate={predicate}")
+                    self._logger.debug(f"Merging partition={partition} with predicate={predicate}, streaming={use_streaming}")
 
                     merge_stats = (
                         delta_table.merge(
@@ -171,7 +175,7 @@ class DeltaTableHelper:
                             source_alias="source",
                             target_alias="target",
                             predicate=predicate,
-                            streamed_exec=True,
+                            streamed_exec=use_streaming,  # Adaptive streaming
                         )
                         .when_matched_update_all()
                         .when_not_matched_insert_all()
@@ -180,19 +184,22 @@ class DeltaTableHelper:
 
                     self._logger.debug(f"Delta Merge Stats: {json.dumps(merge_stats)}")
             else:
+                # Performance optimization: Use streaming for large datasets
+                use_streaming_merge = data.num_rows > 50000
+                
                 merge_stats = (
                     delta_table.merge(
                         source=data,
                         source_alias="source",
                         target_alias="target",
                         predicate=" AND ".join(predicate_ops),
-                        streamed_exec=False,
+                        streamed_exec=use_streaming_merge,  # Adaptive streaming
                     )
                     .when_matched_update_all()
                     .when_not_matched_insert_all()
                     .execute()
                 )
-                self._logger.debug(f"Delta Merge Stats: {json.dumps(merge_stats)}")
+                self._logger.debug(f"Delta Merge Stats (streaming={use_streaming_merge}): {json.dumps(merge_stats)}")
         elif (
             write_type == "full_refresh"
             or (write_type == "incremental" and delta_table is None)
