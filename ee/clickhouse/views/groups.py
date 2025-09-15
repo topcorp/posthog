@@ -23,6 +23,8 @@ from posthog.api.routing import TeamAndOrgViewSetMixin
 from posthog.api.utils import action
 from posthog.clickhouse.client import sync_execute
 from posthog.clickhouse.kafka_engine import trim_quotes_expr
+from posthog.clickhouse.client.limit import get_api_personal_rate_limiter
+from posthog.queries.property_values import PropertyValueCircuitBreaker
 from posthog.helpers.dashboard_templates import create_group_type_mapping_detail_dashboard
 from posthog.models import Notebook
 from posthog.models.activity_logging.activity_log import Change, Detail, load_activity, log_activity
@@ -587,53 +589,65 @@ class GroupsViewSet(TeamAndOrgViewSetMixin, mixins.ListModelMixin, mixins.Create
 
     @action(methods=["GET"], detail=False, required_scopes=["group:read"])
     def property_definitions(self, request: request.Request, **kw):
-        rows = sync_execute(
-            f"""
-            SELECT group_type_index, tupleElement(keysAndValues, 1) as key, count(*) as count
-            FROM groups
-            ARRAY JOIN JSONExtractKeysAndValuesRaw(group_properties) as keysAndValues
-            WHERE team_id = %(team_id)s
-            GROUP BY group_type_index, tupleElement(keysAndValues, 1)
-            ORDER BY group_type_index ASC, count DESC, key ASC
-            """,
-            {"team_id": self.team.pk},
-        )
+        circuit_breaker = PropertyValueCircuitBreaker(self.team.pk)
+        rate_limiter = get_api_personal_rate_limiter()
 
-        group_type_index_to_properties = defaultdict(list)
-        for group_type_index, key, count in rows:
-            group_type_index_to_properties[str(group_type_index)].append({"name": key, "count": count})
+        with circuit_breaker.protect():
+            with rate_limiter.run(team_id=self.team.pk, org_id=str(self.team.organization_id), is_api=True):
+                rows = sync_execute(
+                    f"""
+                    SELECT group_type_index, tupleElement(keysAndValues, 1) as key, count(*) as count
+                    FROM groups
+                    ARRAY JOIN JSONExtractKeysAndValuesRaw(group_properties) as keysAndValues
+                    WHERE team_id = %(team_id)s
+                    GROUP BY group_type_index, tupleElement(keysAndValues, 1)
+                    ORDER BY group_type_index ASC, count DESC, key ASC
+                    SETTINGS max_execution_time = 15, max_memory_usage = 300000000, max_bytes_before_external_group_by = 100000000, max_rows_to_read = 5000000, timeout_before_checking_execution_speed = 3
+                    """,
+                    {"team_id": self.team.pk},
+                )
 
-        return response.Response(group_type_index_to_properties)
+                group_type_index_to_properties = defaultdict(list)
+                for group_type_index, key, count in rows:
+                    group_type_index_to_properties[str(group_type_index)].append({"name": key, "count": count})
+
+                return response.Response(group_type_index_to_properties)
 
     @action(methods=["GET"], detail=False, required_scopes=["group:read"])
     def property_values(self, request: request.Request, **kw):
-        value_filter = request.GET.get("value")
+        circuit_breaker = PropertyValueCircuitBreaker(self.team.pk)
+        rate_limiter = get_api_personal_rate_limiter()
 
-        query = f"""
-            SELECT {trim_quotes_expr("tupleElement(keysAndValues, 2)")} as value, count(*) as count
-            FROM groups
-            ARRAY JOIN JSONExtractKeysAndValuesRaw(group_properties) as keysAndValues
-            WHERE team_id = %(team_id)s
-              AND group_type_index = %(group_type_index)s
-              AND tupleElement(keysAndValues, 1) = %(key)s
-              {f"AND {trim_quotes_expr('tupleElement(keysAndValues, 2)')} ILIKE %(value_filter)s" if value_filter else ""}
-            GROUP BY value
-            ORDER BY count DESC, value ASC
-            LIMIT 20
-        """
+        with circuit_breaker.protect():
+            with rate_limiter.run(team_id=self.team.pk, org_id=str(self.team.organization_id), is_api=True):
+                value_filter = request.GET.get("value")
 
-        params = {
-            "team_id": self.team.pk,
-            "group_type_index": request.GET["group_type_index"],
-            "key": request.GET["key"],
-        }
+                query = f"""
+                    SELECT {trim_quotes_expr("tupleElement(keysAndValues, 2)")} as value, count(*) as count
+                    FROM groups
+                    ARRAY JOIN JSONExtractKeysAndValuesRaw(group_properties) as keysAndValues
+                    WHERE team_id = %(team_id)s
+                      AND group_type_index = %(group_type_index)s
+                      AND tupleElement(keysAndValues, 1) = %(key)s
+                      {f"AND {trim_quotes_expr('tupleElement(keysAndValues, 2)')} ILIKE %(value_filter)s" if value_filter else ""}
+                    GROUP BY value
+                    ORDER BY count DESC, value ASC
+                    LIMIT 20
+                    SETTINGS max_execution_time = 15, max_memory_usage = 300000000, max_bytes_before_external_group_by = 100000000, max_rows_to_read = 5000000, timeout_before_checking_execution_speed = 3
+                """
 
-        if value_filter:
-            params["value_filter"] = f"%{value_filter}%"
+                params = {
+                    "team_id": self.team.pk,
+                    "group_type_index": request.GET["group_type_index"],
+                    "key": request.GET["key"],
+                }
 
-        rows = sync_execute(query, params)
+                if value_filter:
+                    params["value_filter"] = f"%{value_filter}%"
 
-        return response.Response([{"name": name, "count": count} for name, count in rows])
+                rows = sync_execute(query, params)
+
+                return response.Response([{"name": name, "count": count} for name, count in rows])
 
     def _is_crm_enabled(self, user: User) -> bool:
         return posthoganalytics.feature_enabled(
