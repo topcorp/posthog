@@ -145,10 +145,18 @@ export const hogQLQueryEditorLogic = kea<hogQLQueryEditorLogicType>([
             const types = props.queryResponse?.types ?? []
 
             await dataWarehouseViewsLogic.asyncActions.createDataWarehouseSavedQuery({ name, query, types })
+
+            // Refresh saved insights to reflect the new SQL view in the UI
+            const { savedInsightsLogic } = await import('scenes/saved-insights/savedInsightsLogic')
+            savedInsightsLogic.findMounted()?.actions.loadInsights()
         },
         onUpdateView: async () => {
             const types = props.queryResponse?.types ?? []
             actions.updateView(values.queryInput, types)
+
+            // Refresh saved insights to reflect the updated SQL view in the UI
+            const { savedInsightsLogic } = await import('scenes/saved-insights/savedInsightsLogic')
+            savedInsightsLogic.findMounted()?.actions.loadInsights()
         },
     })),
 ])

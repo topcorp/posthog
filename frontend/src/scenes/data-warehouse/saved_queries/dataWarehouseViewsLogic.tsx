@@ -131,8 +131,12 @@ export const dataWarehouseViewsLogic = kea<dataWarehouseViewsLogicType>([
         ],
     })),
     listeners(({ actions, cache }) => ({
-        createDataWarehouseSavedQuerySuccess: () => {
+        createDataWarehouseSavedQuerySuccess: async () => {
             actions.loadDatabase()
+
+            // Refresh saved insights to reflect the new SQL view in the UI
+            const { savedInsightsLogic } = await import('scenes/saved-insights/savedInsightsLogic')
+            savedInsightsLogic.findMounted()?.actions.loadInsights()
         },
         loadDataModelingJobsSuccess: ({ payload }) => {
             clearTimeout(cache.dataModelingJobsRefreshTimeout)
@@ -143,7 +147,7 @@ export const dataWarehouseViewsLogic = kea<dataWarehouseViewsLogicType>([
                 }
             }, REFRESH_INTERVAL)
         },
-        updateDataWarehouseSavedQuerySuccess: ({ payload }) => {
+        updateDataWarehouseSavedQuerySuccess: async ({ payload }) => {
             // in the case where we are scheduling a materialized view, send an event
             if (payload && payload.lifecycle && payload.sync_frequency) {
                 // this function exists as an upsert, so we need to check if the view was created or updated
@@ -157,6 +161,10 @@ export const dataWarehouseViewsLogic = kea<dataWarehouseViewsLogicType>([
             }
 
             actions.loadDatabase()
+
+            // Refresh saved insights to reflect the updated SQL view in the UI
+            const { savedInsightsLogic } = await import('scenes/saved-insights/savedInsightsLogic')
+            savedInsightsLogic.findMounted()?.actions.loadInsights()
         },
         updateDataWarehouseSavedQueryError: () => {
             lemonToast.error('Failed to update view')
