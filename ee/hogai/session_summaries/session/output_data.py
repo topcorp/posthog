@@ -3,6 +3,7 @@ from typing import Any
 from rest_framework import serializers
 import yaml
 import structlog
+from prometheus_client import Counter
 from ee.hogai.session_summaries import SummaryValidationError
 from ee.hogai.session_summaries.constants import HALLUCINATED_EVENTS_MIN_RATIO
 from ee.hogai.session_summaries.utils import (
@@ -13,6 +14,13 @@ from ee.hogai.session_summaries.utils import (
 )
 
 logger = structlog.get_logger(__name__)
+
+# Error metrics for YAML parsing and validation
+SESSION_SUMMARY_ERRORS = Counter(
+    "session_summary_errors_total",
+    "Total errors in session summarization processing",
+    labelnames=["error_type", "validation_stage"]
+)
 
 
 class RawKeyActionSerializer(serializers.Serializer):
@@ -186,6 +194,11 @@ def _remove_hallucinated_events(
         and total_summary_events > 0
         and len(hallucinated_events) / total_summary_events > HALLUCINATED_EVENTS_MIN_RATIO
     ):
+        SESSION_SUMMARY_ERRORS.labels(error_type="excessive_hallucinated_events", validation_stage="validation").inc()
+        logger.error("Too many hallucinated events detected", session_id=session_id, 
+                    hallucinated_count=len(hallucinated_events), 
+                    total_events=total_summary_events,
+                    hallucination_ratio=len(hallucinated_events) / total_summary_events)
         raise SummaryValidationError(
             f"Too many hallucinated events ({len(hallucinated_events)}/{total_summary_events}) for session id ({session_id})"
             f"in the raw session summary: {[x[-1] for x in hallucinated_events]} "  # Log events
@@ -201,16 +214,31 @@ def load_raw_session_summary_from_llm_content(
     raw_content: str, allowed_event_ids: list[str], session_id: str, *, final_validation: bool
 ) -> RawSessionSummarySerializer | None:
     if not raw_content:
+        SESSION_SUMMARY_ERRORS.labels(error_type="missing_content", validation_stage="input").inc()
+        logger.error("No LLM content provided for session summarization", session_id=session_id)
         raise SummaryValidationError(f"No LLM content found when summarizing session_id {session_id}")
     try:
         json_content: dict = yaml.safe_load(strip_raw_llm_content(raw_content))
+    except yaml.YAMLError as err:
+        SESSION_SUMMARY_ERRORS.labels(error_type="yaml_syntax_error", validation_stage="parsing").inc()
+        logger.error("YAML syntax error in LLM output", session_id=session_id, error=str(err), 
+                    raw_content_length=len(raw_content))
+        raise SummaryValidationError(
+            f"YAML syntax error when parsing LLM content for session_id {session_id}: {err}"
+        ) from err
     except Exception as err:
+        SESSION_SUMMARY_ERRORS.labels(error_type="yaml_parsing_error", validation_stage="parsing").inc()
+        logger.error("Unexpected error during YAML parsing", session_id=session_id, error=str(err), 
+                    raw_content_length=len(raw_content))
         raise SummaryValidationError(
             f"Error loading YAML content into JSON when summarizing session_id {session_id}: {err}"
         ) from err
     # Validate the LLM output against the schema
     raw_session_summary = RawSessionSummarySerializer(data=json_content)
     if not raw_session_summary.is_valid():
+        SESSION_SUMMARY_ERRORS.labels(error_type="schema_validation_error", validation_stage="serialization").inc()
+        logger.error("LLM output failed schema validation", session_id=session_id, 
+                    validation_errors=raw_session_summary.errors)
         raise SummaryValidationError(
             f"Error validating LLM output against the schema when summarizing session_id {session_id}: {raw_session_summary.errors}"
         )
@@ -232,6 +260,10 @@ def load_raw_session_summary_from_llm_content(
             continue
         # Ensure that LLM didn't hallucinate segments
         if key_group_segment_index not in segments_indices:
+            SESSION_SUMMARY_ERRORS.labels(error_type="hallucinated_segment", validation_stage="validation").inc()
+            logger.error("LLM hallucinated segment index", session_id=session_id, 
+                        hallucinated_segment_index=key_group_segment_index, 
+                        valid_segment_indices=segments_indices)
             raise ValueError(
                 f"LLM hallucinated segment index {key_group_segment_index} when summarizing session_id {session_id}: {raw_session_summary.data}"
             )
@@ -249,6 +281,9 @@ def load_raw_session_summary_from_llm_content(
             # Skip hallucinated events
             if event_id not in allowed_event_ids:
                 hallucinated_events.append((group_index, event_index, event))
+                SESSION_SUMMARY_ERRORS.labels(error_type="hallucinated_event", validation_stage="validation").inc()
+                logger.warning("Hallucinated event detected", session_id=session_id, 
+                             hallucinated_event_id=event_id, segment_index=key_group_segment_index)
                 continue
     # TODO: Investigate how to reduce their appearance in the first place
     raw_session_summary = _remove_hallucinated_events(
@@ -274,6 +309,9 @@ def _validate_enriched_summary(data: dict[str, Any], session_id: str) -> Session
     # Validating even when processing incomplete chunks as the `.data` can't be used without validation check
     if not session_summary.is_valid():
         # Most of the fields are optional, so failed validation should be reported
+        SESSION_SUMMARY_ERRORS.labels(error_type="enriched_validation_error", validation_stage="enrichment").inc()
+        logger.error("Enriched summary failed validation", session_id=session_id, 
+                    validation_errors=session_summary.errors)
         raise SummaryValidationError(
             f"Error validating enriched content against the schema when summarizing session_id {session_id}: {session_summary.errors}"
         )
