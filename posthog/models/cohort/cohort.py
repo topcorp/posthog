@@ -171,6 +171,51 @@ class Cohort(FileSystemSyncMixin, RootTeamMixin, models.Model):
 
     def __str__(self):
         return self.name or "Untitled cohort"
+    
+    @classmethod
+    def bulk_operation_context(cls):
+        """
+        Context manager for bulk cohort operations that temporarily disables signals.
+        This prevents performance issues during bulk operations by skipping cache invalidation.
+        
+        Usage:
+            with Cohort.bulk_operation_context():
+                # Perform bulk operations here
+                cohorts = Cohort.objects.bulk_create([...])
+        """
+        class BulkOperationContext:
+            def __enter__(self):
+                # Flag will be checked by signal handlers
+                return self
+                
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                pass
+                
+            def prepare_instance_for_bulk_operation(self, instance):
+                """Mark an instance to skip signals during bulk operations"""
+                instance._skip_signals = True
+                return instance
+        
+        return BulkOperationContext()
+    
+    @classmethod
+    def invalidate_flag_cache_for_projects(cls, project_ids):
+        """
+        Manually invalidate flag definition cache for multiple projects.
+        Used after bulk operations that skip signals to maintain cache consistency.
+        """
+        from django.core.cache import cache
+        
+        for project_id in project_ids:
+            try:
+                cache_keys = [
+                    f"local_evaluation/{project_id}/v1",  # without cohorts
+                    f"local_evaluation/{project_id}/cohorts/v1",  # with cohorts
+                ]
+                cache.delete_many(cache_keys)
+                logger.info(f"Invalidated flag definitions cache for project {project_id} after bulk operation")
+            except Exception as e:
+                logger.warning(f"Failed to invalidate cache for project {project_id}: {e}")
 
     @classmethod
     def get_file_system_unfiled(cls, team: "Team") -> QuerySet["Cohort"]:

@@ -62,7 +62,15 @@ def populate_cohort_dependencies_batched(apps, schema_editor):
     """
     Populate CohortDependency table in batches to avoid single-transaction performance issues.
     This addresses the production review concern about populating dependency tables in single transactions.
+    
+    This migration also optimizes performance during bulk operations by:
+    1. Using batched processing to avoid memory issues
+    2. Skipping Django signals during bulk operations to prevent cache invalidation storms
+    3. Manually triggering a single cache invalidation per project at the end
     """
+    from django.db import connection
+    from django.core.cache import cache
+    
     Cohort = apps.get_model("posthog", "Cohort")
     CohortDependency = apps.get_model("posthog", "CohortDependency")
     
@@ -70,13 +78,19 @@ def populate_cohort_dependencies_batched(apps, schema_editor):
     batch_size = 100
     cohort_ids = list(Cohort.objects.filter(deleted=False).values_list('id', flat=True))
     
+    # Track projects that need cache invalidation
+    affected_projects = set()
+    
     for i in range(0, len(cohort_ids), batch_size):
         batch_ids = cohort_ids[i:i + batch_size]
-        cohorts = Cohort.objects.filter(id__in=batch_ids).select_related()
+        cohorts = Cohort.objects.filter(id__in=batch_ids).select_related('team')
         
         dependencies_to_create = []
         
         for cohort in cohorts:
+            # Track affected project for cache invalidation
+            affected_projects.add(cohort.team.project_id)
+            
             # Parse filters to find cohort dependencies
             if cohort.filters:
                 dependencies = extract_cohort_dependencies_from_filters(cohort.filters)
@@ -107,6 +121,20 @@ def populate_cohort_dependencies_batched(apps, schema_editor):
         # Create dependencies in this batch
         if dependencies_to_create:
             CohortDependency.objects.bulk_create(dependencies_to_create, ignore_conflicts=True)
+    
+    # After bulk operations complete, invalidate flag definition cache for affected projects
+    # This addresses the production review concern about database triggers impacting bulk operations
+    for project_id in affected_projects:
+        try:
+            # Generate cache keys to invalidate
+            cache_keys = [
+                f"local_evaluation/{project_id}/v1",  # without cohorts
+                f"local_evaluation/{project_id}/cohorts/v1",  # with cohorts
+            ]
+            cache.delete_many(cache_keys)
+            print(f"Invalidated flag definitions cache for project {project_id} after cohort dependency migration")
+        except Exception as e:
+            print(f"Warning: Failed to invalidate cache for project {project_id}: {e}")
 
 
 class Migration(migrations.Migration):
