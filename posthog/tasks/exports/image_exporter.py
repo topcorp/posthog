@@ -103,7 +103,7 @@ def _export_to_png(exported_asset: ExportedAsset) -> None:
         if not os.path.exists(TMP_DIR):
             os.makedirs(TMP_DIR)
 
-        access_token = get_public_access_token(exported_asset, timedelta(minutes=15))
+        access_token = get_public_access_token(exported_asset, timedelta(minutes=settings.EXPORT_ACCESS_TOKEN_EXPIRY_MINUTES))
 
         screenshot_width: ScreenWidth
         wait_for_css_selector: CSSSelector
@@ -181,7 +181,7 @@ def _screenshot_asset(
         posthoganalytics.tag("url_to_render", url_to_render)
 
         try:
-            WebDriverWait(driver, 20).until(lambda x: x.find_element(By.CSS_SELECTOR, wait_for_css_selector))
+            WebDriverWait(driver, 15).until(lambda x: x.find_element(By.CSS_SELECTOR, wait_for_css_selector))
         except TimeoutException:
             with posthoganalytics.new_context():
                 posthoganalytics.tag("stage", "image_exporter.page_load_timeout")
@@ -196,7 +196,7 @@ def _screenshot_asset(
 
         try:
             # Also wait until nothing is loading
-            WebDriverWait(driver, 20).until_not(lambda x: x.find_element(By.CLASS_NAME, "Spinner"))
+            WebDriverWait(driver, 15).until_not(lambda x: x.find_element(By.CLASS_NAME, "Spinner"))
         except TimeoutException:
             with posthoganalytics.new_context():
                 posthoganalytics.tag("stage", "image_exporter.wait_for_spinner_timeout")
