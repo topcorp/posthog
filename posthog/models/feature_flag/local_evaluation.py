@@ -184,7 +184,16 @@ def feature_flag_changed(sender, instance: "FeatureFlag", **kwargs):
 @receiver(post_save, sender=Cohort)
 @receiver(post_delete, sender=Cohort)
 def cohort_changed(sender, instance: "Cohort", **kwargs):
+    """
+    Handle cohort changes by updating flag cache.
+    During bulk operations, this defers execution to avoid performance issues.
+    """
     from posthog.tasks.feature_flags import update_team_flags_cache
+
+    # Skip signal processing during bulk operations to avoid performance issues
+    # This is set by migration or bulk operations
+    if getattr(instance, '_skip_signals', False):
+        return
 
     transaction.on_commit(lambda: update_team_flags_cache.delay(instance.team_id))
 

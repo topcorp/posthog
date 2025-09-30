@@ -4,6 +4,7 @@ from typing import cast, Any
 from uuid import uuid4
 from langgraph.types import StreamWriter
 import structlog
+from prometheus_client import Counter, Histogram, Gauge
 from langchain_core.runnables import RunnableConfig
 
 from ee.hogai.graph.base import AssistantNode
@@ -20,11 +21,77 @@ from langgraph.config import get_stream_writer
 from langchain_core.messages import AIMessageChunk
 
 
+# Performance metrics for session summarization workflow
+SESSION_SUMMARY_WORKFLOW_DURATION = Histogram(
+    "session_summary_workflow_duration_seconds",
+    "Time spent in session summarization workflow",
+    labelnames=["workflow_type", "session_count_range", "team_id"]
+)
+
+SESSION_SUMMARY_WORKFLOW_COUNT = Counter(
+    "session_summary_workflow_total",
+    "Total session summarization workflows executed", 
+    labelnames=["workflow_type", "session_count_range", "status"]
+)
+
+SESSION_SUMMARY_SESSION_COUNT = Gauge(
+    "session_summary_sessions_processed",
+    "Number of sessions processed in summarization workflow",
+    labelnames=["workflow_type", "team_id"]
+)
+
+SESSION_SUMMARY_DB_QUERY_DURATION = Histogram(
+    "session_summary_db_query_duration_seconds", 
+    "Time spent querying database for session data",
+    labelnames=["query_type", "team_id"]
+)
+
+
 class SessionSummarizationNode(AssistantNode):
     logger = structlog.get_logger(__name__)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+
+    def _get_session_count_range(self, count: int) -> str:
+        """Categorize session count for metrics tracking."""
+        if count == 1:
+            return "single"
+        elif count <= GROUP_SUMMARIES_MIN_SESSIONS:
+            return f"small_batch_1_{GROUP_SUMMARIES_MIN_SESSIONS}"
+        elif count <= 20:
+            return f"medium_batch_{GROUP_SUMMARIES_MIN_SESSIONS + 1}_20"
+        elif count <= 100:
+            return "large_batch_21_100"
+        else:
+            return "extra_large_batch_100_plus"
+
+    def _get_workflow_type(self, session_count: int) -> str:
+        """Determine workflow type based on session count."""
+        return "individual" if session_count <= GROUP_SUMMARIES_MIN_SESSIONS else "group"
+
+    def _track_workflow_metrics(self, workflow_type: str, session_count: int, 
+                               duration_seconds: float, status: str = "success") -> None:
+        """Track workflow performance metrics."""
+        session_count_range = self._get_session_count_range(session_count)
+        team_id_str = str(getattr(self._team, "id", "unknown"))
+        
+        SESSION_SUMMARY_WORKFLOW_DURATION.labels(
+            workflow_type=workflow_type, 
+            session_count_range=session_count_range,
+            team_id=team_id_str
+        ).observe(duration_seconds)
+        
+        SESSION_SUMMARY_WORKFLOW_COUNT.labels(
+            workflow_type=workflow_type,
+            session_count_range=session_count_range, 
+            status=status
+        ).inc()
+        
+        SESSION_SUMMARY_SESSION_COUNT.labels(
+            workflow_type=workflow_type,
+            team_id=team_id_str
+        ).set(session_count)
 
     def _get_stream_writer(self) -> StreamWriter | None:
         """Get the stream writer for custom events"""
@@ -86,36 +153,60 @@ class SessionSummarizationNode(AssistantNode):
     def _get_session_ids_with_filters(self, replay_filters: MaxRecordingUniversalFilters) -> list[str] | None:
         from posthog.session_recordings.queries.session_recording_list_from_query import SessionRecordingListFromQuery
 
-        # Convert Max filters into recordings query format
-        properties = []
-        if replay_filters.filter_group and replay_filters.filter_group.values:
-            for inner_group in replay_filters.filter_group.values:
-                if hasattr(inner_group, "values"):
-                    properties.extend(inner_group.values)
-        recordings_query = RecordingsQuery(
-            date_from=replay_filters.date_from,
-            date_to=replay_filters.date_to,
-            properties=properties,
-            filter_test_accounts=replay_filters.filter_test_accounts,
-            order=replay_filters.order,
-            # Handle duration filters
-            having_predicates=(
-                [
-                    {"key": "duration", "type": "recording", "operator": dur.operator, "value": dur.value}
-                    for dur in (replay_filters.duration or [])
-                ]
-                if replay_filters.duration
-                else None
-            ),
-        )
-        # Execute the query to get session IDs
-        query_runner = SessionRecordingListFromQuery(
-            team=self._team, query=recordings_query, hogql_query_modifiers=None
-        )
-        results = query_runner.run()
-        # Extract session IDs
-        session_ids = [recording["session_id"] for recording in results.results]
-        return session_ids if session_ids else None
+        team_id_str = str(getattr(self._team, "id", "unknown"))
+        query_start_time = time.time()
+        
+        try:
+            # Convert Max filters into recordings query format
+            properties = []
+            if replay_filters.filter_group and replay_filters.filter_group.values:
+                for inner_group in replay_filters.filter_group.values:
+                    if hasattr(inner_group, "values"):
+                        properties.extend(inner_group.values)
+            recordings_query = RecordingsQuery(
+                date_from=replay_filters.date_from,
+                date_to=replay_filters.date_to,
+                properties=properties,
+                filter_test_accounts=replay_filters.filter_test_accounts,
+                order=replay_filters.order,
+                # Handle duration filters
+                having_predicates=(
+                    [
+                        {"key": "duration", "type": "recording", "operator": dur.operator, "value": dur.value}
+                        for dur in (replay_filters.duration or [])
+                    ]
+                    if replay_filters.duration
+                    else None
+                ),
+            )
+            # Execute the query to get session IDs
+            query_runner = SessionRecordingListFromQuery(
+                team=self._team, query=recordings_query, hogql_query_modifiers=None
+            )
+            results = query_runner.run()
+            # Extract session IDs
+            session_ids = [recording["session_id"] for recording in results.results]
+            
+            # Track query performance
+            query_duration = time.time() - query_start_time
+            SESSION_SUMMARY_DB_QUERY_DURATION.labels(
+                query_type="session_ids_query", 
+                team_id=team_id_str
+            ).observe(query_duration)
+            
+            self.logger.info("Database query for session IDs completed",
+                           query_duration_seconds=query_duration,
+                           session_count=len(session_ids) if session_ids else 0,
+                           team_id=team_id_str)
+            
+            return session_ids if session_ids else None
+        except Exception as e:
+            query_duration = time.time() - query_start_time
+            SESSION_SUMMARY_DB_QUERY_DURATION.labels(
+                query_type="session_ids_query_failed",
+                team_id=team_id_str  
+            ).observe(query_duration)
+            raise
 
     async def _summarize_sessions_individually(self, session_ids: list[str], writer: StreamWriter | None) -> str:
         """Summarize sessions individually with progress updates."""
@@ -210,22 +301,43 @@ class SessionSummarizationNode(AssistantNode):
                     root_tool_call_id=None,
                 )
             # Process sessions based on count
-            base_message = f"Found sessions ({len(session_ids)})"
-            if len(session_ids) <= GROUP_SUMMARIES_MIN_SESSIONS:
-                # If small amount of sessions - there are no patterns to extract, so summarize them individually and return as is
-                self._stream_progress(
-                    progress_message=f"{base_message}. We will do a quick summary, as the scope is small",
-                    writer=writer,
-                )
-                summaries_content = await self._summarize_sessions_individually(session_ids=session_ids, writer=writer)
-            else:
-                # For large groups, process in detail, searching for patterns
-                # TODO: Allow users to define the pattern themselves (or rather catch it from the query)
-                self._stream_progress(
-                    progress_message=f"{base_message}. We will analyze in detail, and store the report in a notebook",
-                    writer=writer,
-                )
-                summaries_content = await self._summarize_sessions_as_group(session_ids=session_ids, writer=writer)
+            session_count = len(session_ids)
+            workflow_type = self._get_workflow_type(session_count)
+            workflow_start_time = time.time()
+            
+            base_message = f"Found sessions ({session_count})"
+            try:
+                if session_count <= GROUP_SUMMARIES_MIN_SESSIONS:
+                    # If small amount of sessions - there are no patterns to extract, so summarize them individually and return as is
+                    self._stream_progress(
+                        progress_message=f"{base_message}. We will do a quick summary, as the scope is small (DB-based approach for <{GROUP_SUMMARIES_MIN_SESSIONS + 1} sessions)",
+                        writer=writer,
+                    )
+                    summaries_content = await self._summarize_sessions_individually(session_ids=session_ids, writer=writer)
+                else:
+                    # For large groups, process in detail, searching for patterns
+                    # TODO: Allow users to define the pattern themselves (or rather catch it from the query)
+                    self._stream_progress(
+                        progress_message=f"{base_message}. We will analyze in detail, and store the report in a notebook (pattern-based group analysis)",
+                        writer=writer,
+                    )
+                    summaries_content = await self._summarize_sessions_as_group(session_ids=session_ids, writer=writer)
+                
+                # Track successful workflow completion
+                workflow_duration = time.time() - workflow_start_time
+                self._track_workflow_metrics(workflow_type, session_count, workflow_duration, "success")
+                
+                self.logger.info("Session summarization workflow completed successfully",
+                               workflow_type=workflow_type,
+                               session_count=session_count,
+                               duration_seconds=workflow_duration,
+                               team_id=str(getattr(self._team, "id", "unknown")))
+                
+            except Exception as e:
+                # Track failed workflow
+                workflow_duration = time.time() - workflow_start_time
+                self._track_workflow_metrics(workflow_type, session_count, workflow_duration, "error")
+                raise
             return PartialAssistantState(
                 messages=[
                     AssistantToolCallMessage(
@@ -238,6 +350,13 @@ class SessionSummarizationNode(AssistantNode):
                 root_tool_call_id=None,
             )
         except Exception as err:
+            # Track failure metrics if we have session data
+            if 'session_ids' in locals() and session_ids:
+                session_count = len(session_ids)
+                workflow_type = self._get_workflow_type(session_count)
+                failure_duration = time.time() - start_time
+                self._track_workflow_metrics(workflow_type, session_count, failure_duration, "failure")
+            
             self._log_failure("Session summarization failed", conversation_id, start_time, err)
             return self._create_error_response(self._base_error_instructions, state.root_tool_call_id)
 

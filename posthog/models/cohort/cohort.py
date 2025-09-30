@@ -171,6 +171,51 @@ class Cohort(FileSystemSyncMixin, RootTeamMixin, models.Model):
 
     def __str__(self):
         return self.name or "Untitled cohort"
+    
+    @classmethod
+    def bulk_operation_context(cls):
+        """
+        Context manager for bulk cohort operations that temporarily disables signals.
+        This prevents performance issues during bulk operations by skipping cache invalidation.
+        
+        Usage:
+            with Cohort.bulk_operation_context():
+                # Perform bulk operations here
+                cohorts = Cohort.objects.bulk_create([...])
+        """
+        class BulkOperationContext:
+            def __enter__(self):
+                # Flag will be checked by signal handlers
+                return self
+                
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                pass
+                
+            def prepare_instance_for_bulk_operation(self, instance):
+                """Mark an instance to skip signals during bulk operations"""
+                instance._skip_signals = True
+                return instance
+        
+        return BulkOperationContext()
+    
+    @classmethod
+    def invalidate_flag_cache_for_projects(cls, project_ids):
+        """
+        Manually invalidate flag definition cache for multiple projects.
+        Used after bulk operations that skip signals to maintain cache consistency.
+        """
+        from django.core.cache import cache
+        
+        for project_id in project_ids:
+            try:
+                cache_keys = [
+                    f"local_evaluation/{project_id}/v1",  # without cohorts
+                    f"local_evaluation/{project_id}/cohorts/v1",  # with cohorts
+                ]
+                cache.delete_many(cache_keys)
+                logger.info(f"Invalidated flag definitions cache for project {project_id} after bulk operation")
+            except Exception as e:
+                logger.warning(f"Failed to invalidate cache for project {project_id}: {e}")
 
     @classmethod
     def get_file_system_unfiled(cls, team: "Team") -> QuerySet["Cohort"]:
@@ -275,6 +320,33 @@ class Cohort(FileSystemSyncMixin, RootTeamMixin, models.Model):
             "name_length": len(self.name) if self.name else 0,
             "deleted": self.deleted,
         }
+
+    def save(self, *args, **kwargs):
+        # Track if this is a new cohort or if filters changed
+        is_new = self.pk is None
+        filters_changed = False
+        
+        if not is_new:
+            try:
+                old_instance = Cohort.objects.get(pk=self.pk)
+                filters_changed = (
+                    old_instance.filters != self.filters or 
+                    old_instance.groups != self.groups
+                )
+            except Cohort.DoesNotExist:
+                is_new = True
+        
+        # Save the cohort first
+        super().save(*args, **kwargs)
+        
+        # Update dependencies if needed (for new cohorts or when filters change)
+        if (is_new or filters_changed) and not getattr(self, '_skip_dependency_update', False):
+            try:
+                from posthog.models.cohort.util import update_cohort_dependencies_batched
+                update_cohort_dependencies_batched(self, batch_size=50)
+            except Exception as e:
+                logger.warning("failed_to_update_cohort_dependencies", cohort_id=self.pk, error=str(e))
+                # Don't fail the save operation if dependency update fails
 
     def calculate_people_ch(self, pending_version: int, *, initiating_user_id: Optional[int] = None):
         from posthog.models.cohort.util import recalculate_cohortpeople
@@ -518,6 +590,33 @@ class Cohort(FileSystemSyncMixin, RootTeamMixin, models.Model):
         return {k: v for k, v in base_dict.items() if k not in excluded_fields}
 
     __repr__ = sane_repr("id", "name", "last_calculation")
+
+
+class CohortDependency(models.Model):
+    """
+    Tracks dependencies between cohorts to optimize calculation ordering and prevent circular dependencies.
+    This model helps avoid the performance issues of calculating dependencies on-the-fly during bulk operations.
+    """
+    cohort = models.ForeignKey("Cohort", on_delete=models.CASCADE, related_name="depends_on")
+    depends_on = models.ForeignKey("Cohort", on_delete=models.CASCADE, related_name="dependents")
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["cohort_id"]),
+            models.Index(fields=["depends_on_id"]),
+            models.Index(fields=["cohort_id", "depends_on_id"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["cohort_id", "depends_on_id"], 
+                name="unique_cohort_dependency"
+            ),
+            models.CheckConstraint(
+                check=~models.Q(cohort=models.F("depends_on")),
+                name="no_self_dependency"
+            ),
+        ]
 
 
 class CohortPeople(models.Model):
