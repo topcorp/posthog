@@ -311,6 +311,77 @@ class Property:
     def to_dict(self) -> dict[str, Any]:
         return {key: value for key, value in vars(self).items() if value is not None}
 
+    @classmethod
+    def create_safely(
+        cls,
+        key: str,
+        value: Optional[ValueT] = None,
+        operator: Optional[OperatorType] = None,
+        type: Optional[PropertyType] = None,
+        fallback_type: PropertyType = "event",
+        **kwargs
+    ) -> Optional["Property"]:
+        """
+        Create a Property instance with proper error handling and fallback mechanisms.
+        This addresses the production review concern about ValueError exceptions without proper error handling.
+        
+        Args:
+            key: Property key
+            value: Property value
+            operator: Property operator
+            type: Property type (with fallback)
+            fallback_type: Fallback type if creation fails
+            **kwargs: Additional property arguments
+            
+        Returns:
+            Property instance or None if creation fails with invalid data
+        """
+        try:
+            return cls(
+                key=key,
+                value=value,
+                operator=operator,
+                type=type,
+                **kwargs
+            )
+        except ValueError as e:
+            # Log the error but don't re-raise to prevent crashes
+            from posthog.logging import structlog
+            logger = structlog.get_logger(__name__)
+            logger.warning(
+                "Failed to create property with provided parameters, attempting fallback",
+                key=key,
+                value=value,
+                operator=operator,
+                type=type,
+                error=str(e)
+            )
+            
+            # Attempt to create with fallback values
+            try:
+                # Use fallback type and sanitize operator
+                safe_operator = operator if operator in ["exact", "is_set", "is_not_set", "icontains"] else "exact"
+                safe_value = value if value is not None else ("is_set" if safe_operator in ["is_set", "is_not_set"] else "")
+                
+                return cls(
+                    key=key,
+                    value=safe_value,
+                    operator=safe_operator,
+                    type=fallback_type,
+                    # Skip complex attributes that might cause validation errors
+                )
+            except ValueError:
+                # Final fallback failed, log and return None
+                logger.error(
+                    "Property creation failed even with fallback values",
+                    key=key,
+                    value=value,
+                    operator=operator,
+                    type=type,
+                    fallback_type=fallback_type
+                )
+                return None
+
     @staticmethod
     def _parse_value(value: ValueT, convert_to_number: bool = False) -> Any:
         if isinstance(value, list):

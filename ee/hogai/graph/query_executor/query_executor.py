@@ -200,3 +200,5 @@ class AssistantQueryExecutor:
             return RetentionResultsFormatter(query, response["results"]).format()
         elif isinstance(query, AssistantHogQLQuery | HogQLQuery):
             return SQLResultsFormatter(query, response["results"], response["columns"]).format()
+        else:
+            raise NotImplementedError(f"Unsupported query type: {type(query)}")
